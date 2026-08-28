@@ -13,10 +13,10 @@ Git 仓库地址：https://github.com/zhangwu2005/tiny-coding-agent
    命令默认需人工确认；演示时可加 --auto-approve。
 
 测试
-执行 python -m tests.test_agent，无需 API Key 或第三方依赖。
+执行 python -m tests.test_agent，可完成 9 项离线检查，无需 API Key 或第三方依赖。
 
 特色
-这是一个不依赖 Agent 框架的 OpenAI 兼容 coding agent。项目自行实现对话历史、模型 HTTP 请求、tool calling 解析、循环终止、错误处理和本地工具执行。模型可调用 list_files、read_file、write_file 和 run_command；文件路径限制在工作区内，命令默认需人工批准。
+这是一个不依赖 Agent 框架的 OpenAI 兼容 coding agent。项目自行实现对话历史、模型 HTTP 请求、tool calling 解析、循环终止、错误处理和本地工具执行。六个工具支持目录浏览、分段读取、跨文件搜索、创建文件、唯一匹配替换和命令执行；工具结果有上下文上限，结束时显示轮数、调用数和停止原因。文件路径限制在工作区内，命令默认需人工批准。
 
 提交前检查
 最终 zip 只放 README.txt 和不超过 2 分钟、200 MB 的 mp4 视频；不得提交 API Key。

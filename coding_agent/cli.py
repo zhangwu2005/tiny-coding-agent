@@ -52,6 +52,10 @@ def main() -> int:
         parser.exit(1, f"Model request failed: {exc}\n")
     except KeyboardInterrupt:
         parser.exit(130, "Interrupted. Check the API endpoint or use a compatible gateway, then try again.\n")
+    print(
+        f"\n[summary] stop_reason={result.stop_reason} "
+        f"steps={result.steps} tool_calls={result.tool_calls}"
+    )
     if args.transcript:
         save_transcript(args.transcript, result)
         print(f"[transcript] {args.transcript}")

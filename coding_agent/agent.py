@@ -9,12 +9,17 @@ from typing import Any, Protocol
 from .tools import TOOL_SCHEMAS, ToolError, ToolExecutor, decode_arguments
 
 
+DEFAULT_MAX_TOOL_RESULT_CHARS = 20_000
+
+
 class ModelClient(Protocol):
     def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]: ...
 
 
 SYSTEM_PROMPT = """You are a careful coding agent.
 Work only inside the supplied workspace. Inspect existing files before changing them.
+Use search_text and bounded read_file calls to gather only the context you need.
+Prefer replace_in_file for a precise edit when the old text occurs exactly once; use write_file for new files or full rewrites.
 Use tools for all file and command operations. Explain what you changed and verify it by running a relevant test.
 Treat command execution as potentially destructive and use it only when it helps the task.
 When the task is complete, stop and give a concise summary. Never include or request secrets."""
@@ -24,6 +29,8 @@ When the task is complete, stop and give a concise summary. Never include or req
 class AgentResult:
     answer: str
     steps: int
+    stop_reason: str
+    tool_calls: int
     history: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -34,13 +41,17 @@ class Agent:
         executor: ToolExecutor,
         *,
         max_steps: int = 12,
+        max_tool_result_chars: int = DEFAULT_MAX_TOOL_RESULT_CHARS,
         on_event: Any = None,
     ) -> None:
         if max_steps < 1:
             raise ValueError("max_steps must be positive")
+        if max_tool_result_chars < 1:
+            raise ValueError("max_tool_result_chars must be positive")
         self.client = client
         self.executor = executor
         self.max_steps = max_steps
+        self.max_tool_result_chars = max_tool_result_chars
         self.on_event = on_event or (lambda _event: None)
 
     def _emit(self, event: dict[str, Any]) -> None:
@@ -56,6 +67,7 @@ class Agent:
                 "content": f"Workspace: {self.executor.workspace}\nTask: {task}",
             },
         ]
+        tool_call_count = 0
         for step in range(1, self.max_steps + 1):
             self._emit({"type": "model_request", "step": step})
             message = self.client.complete(history, TOOL_SCHEMAS)
@@ -73,9 +85,16 @@ class Agent:
             if not tool_calls:
                 answer = str(message.get("content") or "(model returned no final answer)")
                 self._emit({"type": "final", "step": step, "answer": answer})
-                return AgentResult(answer=answer, steps=step, history=history)
+                return AgentResult(
+                    answer=answer,
+                    steps=step,
+                    stop_reason="completed",
+                    tool_calls=tool_call_count,
+                    history=history,
+                )
 
             for call_index, call in enumerate(tool_calls, start=1):
+                tool_call_count += 1
                 result = self._run_tool_call(call)
                 tool_message = {
                     "role": "tool",
@@ -91,7 +110,13 @@ class Agent:
         )
         history.append({"role": "assistant", "content": answer})
         self._emit({"type": "stopped", "reason": "max_steps", "step": self.max_steps})
-        return AgentResult(answer=answer, steps=self.max_steps, history=history)
+        return AgentResult(
+            answer=answer,
+            steps=self.max_steps,
+            stop_reason="max_steps",
+            tool_calls=tool_call_count,
+            history=history,
+        )
 
     @staticmethod
     def _call_name(call: dict[str, Any]) -> str:
@@ -104,7 +129,11 @@ class Agent:
         try:
             arguments = decode_arguments(function.get("arguments", call.get("arguments", {})))
             self._emit({"type": "tool_call", "name": name, "arguments": arguments})
-            return self.executor.call(name, arguments)
+            result = self.executor.call(name, arguments)
+            if len(result) <= self.max_tool_result_chars:
+                return result
+            omitted = len(result) - self.max_tool_result_chars
+            return result[: self.max_tool_result_chars] + f"\n... ({omitted} characters omitted)"
         except (ToolError, ValueError, TypeError) as exc:
             return f"ERROR: {exc}"
 
@@ -113,3 +142,10 @@ def save_transcript(path: str, result: AgentResult) -> None:
     with open(path, "w", encoding="utf-8") as stream:
         for message in result.history:
             stream.write(json.dumps(message, ensure_ascii=False) + "\n")
+        summary = {
+            "type": "run_summary",
+            "steps": result.steps,
+            "tool_calls": result.tool_calls,
+            "stop_reason": result.stop_reason,
+        }
+        stream.write(json.dumps(summary, ensure_ascii=False) + "\n")
