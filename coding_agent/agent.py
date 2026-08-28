@@ -16,6 +16,7 @@ class ModelClient(Protocol):
 SYSTEM_PROMPT = """You are a careful coding agent.
 Work only inside the supplied workspace. Inspect existing files before changing them.
 Use tools for all file and command operations. Explain what you changed and verify it by running a relevant test.
+Treat command execution as potentially destructive and use it only when it helps the task.
 When the task is complete, stop and give a concise summary. Never include or request secrets."""
 
 
@@ -62,7 +63,10 @@ class Agent:
                 "role": "assistant",
                 "content": message.get("content"),
             }
-            tool_calls = message.get("tool_calls") or []
+            raw_tool_calls = message.get("tool_calls") or []
+            if not isinstance(raw_tool_calls, list):
+                raw_tool_calls = []
+            tool_calls = [call for call in raw_tool_calls if isinstance(call, dict)]
             if tool_calls:
                 assistant["tool_calls"] = tool_calls
             history.append(assistant)
@@ -71,13 +75,20 @@ class Agent:
                 self._emit({"type": "final", "step": step, "answer": answer})
                 return AgentResult(answer=answer, steps=step, history=history)
 
-            for call in tool_calls:
+            for call_index, call in enumerate(tool_calls, start=1):
                 result = self._run_tool_call(call)
-                tool_message = {"role": "tool", "tool_call_id": call.get("id", f"step-{step}"), "content": result}
+                tool_message = {
+                    "role": "tool",
+                    "tool_call_id": call.get("id", f"step-{step}-call-{call_index}"),
+                    "content": result,
+                }
                 history.append(tool_message)
                 self._emit({"type": "tool_result", "step": step, "name": self._call_name(call), "result": result})
 
-        answer = f"达到最大步数 {self.max_steps}，已停止以避免无限循环。请检查工作区后继续。"
+        answer = (
+            f"Reached the maximum number of steps ({self.max_steps}); stopped to avoid an infinite loop. "
+            "Inspect the workspace and continue with a new task if needed."
+        )
         history.append({"role": "assistant", "content": answer})
         self._emit({"type": "stopped", "reason": "max_steps", "step": self.max_steps})
         return AgentResult(answer=answer, steps=self.max_steps, history=history)

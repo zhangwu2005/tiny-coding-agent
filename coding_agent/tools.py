@@ -115,7 +115,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "list_files",
             "description": "List files below a relative workspace directory.",
-            "parameters": {"type": "object", "properties": {"path": {"type": "string", "default": "."}}},
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string", "default": "."}},
+                "additionalProperties": False,
+            },
         },
     },
     {
@@ -123,7 +127,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "read_file",
             "description": "Read a UTF-8 text file in the workspace.",
-            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+                "additionalProperties": False,
+            },
         },
     },
     {
@@ -135,6 +144,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "type": "object",
                 "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
                 "required": ["path", "content"],
+                "additionalProperties": False,
             },
         },
     },
@@ -143,7 +153,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "run_command",
             "description": "Run a shell command in the workspace. The user must approve it.",
-            "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]},
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+                "additionalProperties": False,
+            },
         },
     },
 ]
