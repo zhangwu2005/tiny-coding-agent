@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import subprocess
 from collections.abc import Iterator
 from pathlib import Path
@@ -17,9 +19,62 @@ MAX_SEARCH_MATCHES = 100
 MAX_SEARCH_FILES = 1_000
 IGNORED_DIRECTORY_NAMES = {".git", ".venv", "__pycache__", "node_modules"}
 
+HIGH_RISK_COMMAND_PATTERNS = (
+    (
+        re.compile(
+            r"\b(?:curl|wget|invoke-webrequest|irm)\b[^\r\n|]*\|\s*"
+            r"(?:bash|sh|powershell|pwsh|iex|invoke-expression)\b",
+            re.IGNORECASE,
+        ),
+        "downloads and executes remote content",
+    ),
+    (re.compile(r"\brm\b[^\r\n]*(?:-rf|-fr|--recursive)", re.IGNORECASE), "recursive deletion"),
+    (re.compile(r"\bremove-item\b[^\r\n]*\s-recurse\b", re.IGNORECASE), "recursive deletion"),
+    (re.compile(r"\brmdir\b[^\r\n]*\s/[sq]\b", re.IGNORECASE), "recursive directory deletion"),
+    (re.compile(r"\bgit\s+reset\s+--hard\b", re.IGNORECASE), "destructive Git reset"),
+    (re.compile(r"\bgit\s+clean\s+-[^\s]*[fd][^\s]*", re.IGNORECASE), "destructive Git clean"),
+    (re.compile(r"\bgit\s+push\b[^\r\n]*\s--force(?:-with-lease)?\b", re.IGNORECASE), "forced remote update"),
+    (re.compile(r"\b(?:format|diskpart|shutdown)\b", re.IGNORECASE), "system-level operation"),
+)
+MEDIUM_RISK_COMMAND_PATTERNS = (
+    (re.compile(r"\b(?:pip|uv)\s+(?:install|uninstall)\b", re.IGNORECASE), "changes Python packages"),
+    (re.compile(r"\b(?:npm|pnpm|yarn)\s+(?:install|add|remove)\b", re.IGNORECASE), "changes packages"),
+    (re.compile(r"\bgit\s+push\b", re.IGNORECASE), "changes a remote repository"),
+    (re.compile(r"\b(?:curl|wget|invoke-webrequest)\b", re.IGNORECASE), "uses the network"),
+)
+VERIFICATION_COMMAND_PATTERNS = (
+    re.compile(r"(?:^|[;&|]\s*)(?:python\s+-m\s+)?pytest\b", re.IGNORECASE),
+    re.compile(r"(?:^|[;&|]\s*)python\s+-m\s+unittest\b", re.IGNORECASE),
+    re.compile(r"(?:^|[;&|]\s*)python\s+-m\s+tests(?:\.[\w.-]+)*\b", re.IGNORECASE),
+    re.compile(r"(?:^|[;&|]\s*)python\s+[^;&|\r\n]*test[^;&|\r\n]*\.py\b", re.IGNORECASE),
+    re.compile(r"(?:^|[;&|]\s*)python\s+-m\s+compileall\b", re.IGNORECASE),
+    re.compile(r"(?:^|[;&|]\s*)(?:npm|pnpm|yarn)\s+(?:run\s+)?(?:test|lint|build)\b", re.IGNORECASE),
+    re.compile(r"(?:^|[;&|]\s*)cargo\s+(?:test|check|clippy)\b", re.IGNORECASE),
+    re.compile(r"(?:^|[;&|]\s*)(?:go|dotnet|mvn|gradle)\s+test\b", re.IGNORECASE),
+    re.compile(r"(?:^|[;&|]\s*)(?:ruff\s+check|mypy|pyright|eslint|tsc)\b", re.IGNORECASE),
+)
+
 
 class ToolError(RuntimeError):
     """A safe, user-facing tool failure."""
+
+
+def assess_command_risk(command: str) -> tuple[str, str]:
+    """Return a small, explainable risk hint; this is not a security sandbox."""
+    for pattern, reason in HIGH_RISK_COMMAND_PATTERNS:
+        if pattern.search(command):
+            return "high", reason
+    for pattern, reason in MEDIUM_RISK_COMMAND_PATTERNS:
+        if pattern.search(command):
+            return "medium", reason
+    if is_verification_command(command):
+        return "low", "recognized verification command"
+    return "medium", "unrecognized shell command"
+
+
+def is_verification_command(command: str) -> bool:
+    """Recognize common test/build checks without claiming that arbitrary commands verify code."""
+    return any(pattern.search(command) for pattern in VERIFICATION_COMMAND_PATTERNS)
 
 
 class ToolExecutor:
@@ -34,6 +89,65 @@ class ToolExecutor:
         self.workspace.mkdir(parents=True, exist_ok=True)
         self.approve_command = approve_command or (lambda _command: False)
         self.command_timeout = command_timeout
+        self.change_version = 0
+        self.last_verified_version = 0
+        self.changed_files: set[str] = set()
+        self.observed_revisions: dict[str, str] = {}
+        self.fully_observed_files: set[str] = set()
+        self.verification_failure_version = 0
+        self.last_verification_failure: dict[str, Any] | None = None
+
+    @property
+    def has_unverified_changes(self) -> bool:
+        return bool(self.changed_files) and (
+            self.change_version > self.last_verified_version
+            or self.last_verification_failure is not None
+        )
+
+    def _record_change(self, file_path: Path) -> None:
+        self.change_version += 1
+        self.changed_files.add(file_path.relative_to(self.workspace).as_posix())
+
+    @staticmethod
+    def _file_revision(file_path: Path) -> str:
+        return hashlib.sha256(file_path.read_bytes()).hexdigest()
+
+    def _remember_revision(self, file_path: Path, *, full_content_seen: bool = False) -> str:
+        revision = self._file_revision(file_path)
+        relative = file_path.relative_to(self.workspace).as_posix()
+        self.observed_revisions[relative] = revision
+        if full_content_seen:
+            self.fully_observed_files.add(relative)
+        return revision
+
+    def _require_fresh_observation(self, file_path: Path, *, require_full: bool = False) -> None:
+        relative = file_path.relative_to(self.workspace).as_posix()
+        observed = self.observed_revisions.get(relative)
+        if observed is None:
+            raise ToolError(f"read_file must be called before editing existing file: {relative}")
+        current = self._file_revision(file_path)
+        if current != observed:
+            self.observed_revisions.pop(relative, None)
+            self.fully_observed_files.discard(relative)
+            raise ToolError(
+                f"stale observation for {relative}; the file changed since it was read, so read it again"
+            )
+        if require_full and relative not in self.fully_observed_files:
+            raise ToolError(
+                f"write_file requires a full read of existing file {relative}; "
+                "use read_file for the whole file or make a precise replace_in_file edit"
+            )
+
+    def _record_verification_failure(self, command: str, exit_code: str, output: str) -> None:
+        nonempty_lines = [line.strip() for line in output.splitlines() if line.strip()]
+        excerpt = "\n".join(nonempty_lines[-8:])[-1_200:] or "(no diagnostic output)"
+        self.verification_failure_version += 1
+        self.last_verification_failure = {
+            "command": command,
+            "exit_code": exit_code,
+            "excerpt": excerpt,
+            "changed_files": sorted(self.changed_files),
+        }
 
     def _path(self, raw: str) -> Path:
         if not raw or Path(raw).is_absolute():
@@ -100,12 +214,20 @@ class ToolExecutor:
 
         lines = file_path.read_text(encoding="utf-8").splitlines(keepends=True)
         if not lines:
-            return f"{path}: empty file"
+            revision = self._remember_revision(file_path, full_content_seen=True)
+            return f"{path}: empty file (revision={revision[:12]})"
         if start_line > len(lines):
             raise ToolError(f"start_line {start_line} is beyond the file's {len(lines)} lines")
         actual_end = min(end_line, len(lines))
+        revision = self._remember_revision(
+            file_path,
+            full_content_seen=start_line == 1 and actual_end == len(lines),
+        )
         content = "".join(lines[start_line - 1 : actual_end])
-        return f"{path}: lines {start_line}-{actual_end} of {len(lines)}\n{content}"
+        return (
+            f"{path}: lines {start_line}-{actual_end} of {len(lines)} "
+            f"(revision={revision[:12]})\n{content}"
+        )
 
     def search_text(self, query: str, path: str = ".", case_sensitive: bool = False) -> str:
         if not isinstance(query, str) or not query:
@@ -148,11 +270,24 @@ class ToolExecutor:
 
     def write_file(self, path: str, content: str) -> str:
         file_path = self._path(path)
-        if len(content.encode("utf-8")) > MAX_FILE_BYTES:
+        encoded_content = content.encode("utf-8")
+        if len(encoded_content) > MAX_FILE_BYTES:
             raise ToolError(f"content is larger than {MAX_FILE_BYTES} bytes")
+        previous_content = file_path.read_text(encoding="utf-8") if file_path.is_file() else None
+        relative = file_path.relative_to(self.workspace).as_posix()
+        if previous_content == content:
+            return f"unchanged: {relative} already contains the requested {len(encoded_content)} bytes"
+        if previous_content is not None:
+            self._require_fresh_observation(file_path, require_full=True)
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(content, encoding="utf-8")
-        return f"wrote {len(content.encode('utf-8'))} bytes to {file_path.relative_to(self.workspace).as_posix()}"
+        revision = self._remember_revision(file_path, full_content_seen=True)
+        self._record_change(file_path)
+        action = "created" if previous_content is None else "updated"
+        return (
+            f"{action} {relative} ({len(encoded_content)} bytes, revision={revision[:12]}); "
+            "verification is now stale"
+        )
 
     def replace_in_file(self, path: str, old_text: str, new_text: str) -> str:
         if not old_text:
@@ -162,6 +297,7 @@ class ToolExecutor:
             raise ToolError(f"not a file: {path}")
         if file_path.stat().st_size > MAX_FILE_BYTES:
             raise ToolError(f"file is larger than {MAX_FILE_BYTES} bytes")
+        self._require_fresh_observation(file_path)
         content = file_path.read_text(encoding="utf-8")
         occurrences = content.count(old_text)
         if occurrences != 1:
@@ -169,13 +305,22 @@ class ToolExecutor:
         updated = content.replace(old_text, new_text, 1)
         if len(updated.encode("utf-8")) > MAX_FILE_BYTES:
             raise ToolError(f"updated file would be larger than {MAX_FILE_BYTES} bytes")
-        file_path.write_text(updated, encoding="utf-8")
         relative = file_path.relative_to(self.workspace).as_posix()
-        return f"replaced 1 occurrence in {relative}"
+        if updated == content:
+            return f"unchanged: replacement has no effect in {relative}"
+        file_path.write_text(updated, encoding="utf-8")
+        revision = self._remember_revision(file_path)
+        self._record_change(file_path)
+        return (
+            f"replaced 1 occurrence in {relative} (revision={revision[:12]}); "
+            "verification is now stale"
+        )
 
     def run_command(self, command: str) -> str:
         if not command.strip():
             raise ToolError("command is empty")
+        risk_level, risk_reason = assess_command_risk(command)
+        verification = is_verification_command(command)
         if not self.approve_command(command):
             raise ToolError("command was not approved by the user")
         try:
@@ -190,9 +335,28 @@ class ToolExecutor:
             )
         except subprocess.TimeoutExpired as exc:
             output = (exc.stdout or "") + (exc.stderr or "")
-            return f"command timed out after {self.command_timeout:g}s\n{output[-6000:]}"
+            if verification:
+                self._record_verification_failure(command, "timeout", output)
+            return (
+                f"risk={risk_level} ({risk_reason})\n"
+                f"verification={'failed' if verification else 'not_recorded'}\n"
+                f"command timed out after {self.command_timeout:g}s\n{output[-6000:]}"
+            )
+        if completed.returncode == 0 and verification:
+            self.last_verified_version = self.change_version
+            self.last_verification_failure = None
         output = (completed.stdout + completed.stderr)[-12_000:]
-        return f"exit_code={completed.returncode}\n{output}".rstrip()
+        if completed.returncode != 0 and verification:
+            self._record_verification_failure(command, str(completed.returncode), output)
+        if verification:
+            verification_status = "passed" if completed.returncode == 0 else "failed"
+        else:
+            verification_status = "not_recorded"
+        return (
+            f"risk={risk_level} ({risk_reason})\n"
+            f"verification={verification_status}\n"
+            f"exit_code={completed.returncode}\n{output}"
+        ).rstrip()
 
     def call(self, name: str, arguments: dict[str, Any]) -> str:
         functions = {

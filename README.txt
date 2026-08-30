@@ -10,13 +10,15 @@ Git 仓库地址：https://github.com/zhangwu2005/tiny-coding-agent
    $env:DEEPSEEK_MODEL="deepseek-v4-flash"
 3. 运行：
    python -m coding_agent --workspace . "创建 hello.py，运行它，并说明结果"
-   命令默认需人工确认；演示时可加 --auto-approve。
+   命令默认需人工确认；演示时可加 --auto-approve，高风险命令仍需显式确认。
 
 测试
-执行 python -m tests.test_agent，可完成 9 项离线检查，无需 API Key 或第三方依赖。
+执行 python -m tests.test_agent，可完成 19 项离线检查，无需 API Key 或第三方依赖。
 
 特色
-这是一个不依赖 Agent 框架的 OpenAI 兼容 coding agent。项目自行实现对话历史、模型 HTTP 请求、tool calling 解析、循环终止、错误处理和本地工具执行。六个工具支持目录浏览、分段读取、跨文件搜索、创建文件、唯一匹配替换和命令执行；工具结果有上下文上限，结束时显示轮数、调用数和停止原因。文件路径限制在工作区内，命令默认需人工批准。
+这是一个不依赖 Agent 框架的 OpenAI 兼容 coding agent。项目自行实现对话历史、模型 HTTP 请求、tool calling 解析、循环终止、错误处理和本地工具执行。六个工具支持目录浏览、分段读取、跨文件搜索、创建文件、唯一匹配替换和命令执行；工具结果有上下文上限。
+
+小型护栏体现“可验证的自主性”：已有文件采用“先读后写”的版本校验，避免盲目覆盖和过期上下文；测试失败会生成带错误证据的反思检查点；修改后未验证会在结束前要求自检；重复工具批次会提前熔断；命令执行给出可解释的风险分级。最终摘要报告修改文件和验证状态。文件路径限制在工作区内，命令默认需人工批准。
 
 提交前检查
 最终 zip 只放 README.txt 和不超过 2 分钟、200 MB 的 mp4 视频；不得提交 API Key。
