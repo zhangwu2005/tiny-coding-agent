@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from .tools import TOOL_SCHEMAS, ToolError, ToolExecutor, decode_arguments
 
@@ -23,7 +23,43 @@ Prefer replace_in_file for a precise edit when the old text occurs exactly once;
 Existing files are revision-guarded: read them before editing and re-read after any stale-observation error.
 Use tools for all file and command operations. Explain what you changed and verify it by running a relevant test.
 Treat command execution as potentially destructive and use it only when it helps the task.
-When the task is complete, stop and give a concise summary. Never include or request secrets."""
+When you believe the task is complete, stop and give a concise completion proposal; the controller decides whether the evidence is sufficient.
+Never include or request secrets."""
+
+VERIFICATION_POLICY_LEVELS = {"none": 0, "syntax": 1, "test": 2, "full": 3}
+
+
+@dataclass(frozen=True)
+class CompletionDecision:
+    accepted: bool
+    reason: str
+    verification_status: str
+    evidence: list[str]
+
+
+class CompletionPolicy:
+    """Deterministic controller policy; the model cannot waive these requirements."""
+
+    def __init__(self, minimum: str = "test") -> None:
+        if minimum not in VERIFICATION_POLICY_LEVELS:
+            choices = ", ".join(VERIFICATION_POLICY_LEVELS)
+            raise ValueError(f"verification policy must be one of: {choices}")
+        self.minimum = minimum
+
+    def evaluate(self, executor: ToolExecutor) -> CompletionDecision:
+        status = executor.verification_status
+        evidence = executor.verification_evidence
+        if executor.has_unresolved_verification_failure:
+            return CompletionDecision(False, "verification_failed", status, evidence)
+        if not executor.changed_files:
+            return CompletionDecision(True, "completed_no_changes", status, evidence)
+
+        required_level = VERIFICATION_POLICY_LEVELS[self.minimum]
+        if executor.strongest_current_verification_level >= required_level:
+            reason = "completed_by_policy" if required_level == 0 else "completed_verified"
+            return CompletionDecision(True, reason, status, evidence)
+        reason = "partial_verification" if evidence else "verification_required"
+        return CompletionDecision(False, reason, status, evidence)
 
 
 @dataclass
@@ -33,6 +69,9 @@ class AgentResult:
     stop_reason: str
     tool_calls: int
     verification_status: str
+    verification_policy: str
+    verification_evidence: list[str]
+    verification_records: list[dict[str, Any]]
     changed_files: list[str]
     history: list[dict[str, Any]] = field(default_factory=list)
 
@@ -46,6 +85,8 @@ class Agent:
         max_steps: int = 12,
         max_tool_result_chars: int = DEFAULT_MAX_TOOL_RESULT_CHARS,
         max_repeated_tool_batches: int = 3,
+        verification_policy: str = "test",
+        approve_incomplete: Callable[[dict[str, Any]], bool] | None = None,
         on_event: Any = None,
     ) -> None:
         if max_steps < 1:
@@ -59,6 +100,8 @@ class Agent:
         self.max_steps = max_steps
         self.max_tool_result_chars = max_tool_result_chars
         self.max_repeated_tool_batches = max_repeated_tool_batches
+        self.completion_policy = CompletionPolicy(verification_policy)
+        self.approve_incomplete = approve_incomplete or (lambda _review: False)
         self.on_event = on_event or (lambda _event: None)
 
     def _emit(self, event: dict[str, Any]) -> None:
@@ -75,7 +118,7 @@ class Agent:
             },
         ]
         tool_call_count = 0
-        last_reminded_change_version = 0
+        last_reminded_change_version = -1
         previous_tool_batch = ""
         repeated_tool_batches = 0
         handled_failure_version = self.executor.verification_failure_version
@@ -94,17 +137,25 @@ class Agent:
                 assistant["tool_calls"] = tool_calls
             history.append(assistant)
             if not tool_calls:
-                if (
-                    self.executor.has_unverified_changes
-                    and self.executor.change_version > last_reminded_change_version
-                    and step + 1 < self.max_steps
-                ):
+                decision = self.completion_policy.evaluate(self.executor)
+                if decision.accepted:
+                    return self._finish(
+                        answer=str(message.get("content") or "(model returned no final answer)"),
+                        step=step,
+                        stop_reason=decision.reason,
+                        tool_call_count=tool_call_count,
+                        history=history,
+                    )
+                if self.executor.change_version > last_reminded_change_version and step < self.max_steps:
                     changed_files = sorted(self.executor.changed_files)
+                    evidence = ", ".join(decision.evidence) or "none"
                     reminder = (
-                        "You changed files but have no successful verification after the latest edit. "
-                        "Run a relevant test or build command if possible. If verification is not possible, "
-                        "explain the limitation explicitly in the final answer. Changed files: "
-                        + ", ".join(changed_files)
+                        "Controller rejected the completion proposal because its deterministic "
+                        f"verification policy is '{self.completion_policy.minimum}'. "
+                        f"Reason: {decision.reason}; current evidence: {evidence}. "
+                        "Run a sufficiently strong relevant check if possible. If that is impossible, "
+                        "explain the limitation in the next completion proposal. Changed files: "
+                        + (", ".join(changed_files) or "(none)")
                     )
                     history.append({"role": "user", "content": reminder})
                     last_reminded_change_version = self.executor.change_version
@@ -112,6 +163,9 @@ class Agent:
                         {
                             "type": "verification_required",
                             "step": step,
+                            "reason": decision.reason,
+                            "policy": self.completion_policy.minimum,
+                            "evidence": decision.evidence,
                             "changed_files": changed_files,
                         }
                     )
@@ -119,22 +173,41 @@ class Agent:
                     repeated_tool_batches = 0
                     continue
                 answer = str(message.get("content") or "(model returned no final answer)")
-                verification_status = self._verification_status()
+                review = {
+                    "answer": answer,
+                    "reason": decision.reason,
+                    "verification_policy": self.completion_policy.minimum,
+                    "verification_status": decision.verification_status,
+                    "verification_evidence": decision.evidence,
+                    "changed_files": sorted(self.executor.changed_files),
+                }
                 self._emit(
                     {
-                        "type": "final",
+                        "type": "user_review_required",
                         "step": step,
-                        "answer": answer,
-                        "verification_status": verification_status,
+                        **review,
                     }
                 )
-                return AgentResult(
+                if self.approve_incomplete(review):
+                    history.append(
+                        {
+                            "role": "user",
+                            "content": "User explicitly accepted completion with insufficient evidence.",
+                        }
+                    )
+                    return self._finish(
+                        answer=answer,
+                        step=step,
+                        stop_reason="user_accepted_incomplete",
+                        tool_call_count=tool_call_count,
+                        history=history,
+                    )
+                self._emit({"type": "stopped", "reason": decision.reason, "step": step})
+                return self._result(
                     answer=answer,
                     steps=step,
-                    stop_reason="completed",
-                    tool_calls=tool_call_count,
-                    verification_status=verification_status,
-                    changed_files=sorted(self.executor.changed_files),
+                    stop_reason=decision.reason,
+                    tool_call_count=tool_call_count,
                     history=history,
                 )
 
@@ -169,13 +242,11 @@ class Agent:
                 answer = f"Stopped because {reason}. Rephrase the task or inspect the repeated call."
                 history.append({"role": "assistant", "content": answer})
                 self._emit({"type": "stopped", "reason": "repeated_tool_call", "step": step})
-                return AgentResult(
+                return self._result(
                     answer=answer,
                     steps=step,
                     stop_reason="repeated_tool_call",
-                    tool_calls=tool_call_count,
-                    verification_status=self._verification_status(),
-                    changed_files=sorted(self.executor.changed_files),
+                    tool_call_count=tool_call_count,
                     history=history,
                 )
 
@@ -224,20 +295,61 @@ class Agent:
         )
         history.append({"role": "assistant", "content": answer})
         self._emit({"type": "stopped", "reason": "max_steps", "step": self.max_steps})
-        return AgentResult(
+        return self._result(
             answer=answer,
             steps=self.max_steps,
             stop_reason="max_steps",
+            tool_call_count=tool_call_count,
+            history=history,
+        )
+
+    def _result(
+        self,
+        *,
+        answer: str,
+        steps: int,
+        stop_reason: str,
+        tool_call_count: int,
+        history: list[dict[str, Any]],
+    ) -> AgentResult:
+        return AgentResult(
+            answer=answer,
+            steps=steps,
+            stop_reason=stop_reason,
             tool_calls=tool_call_count,
-            verification_status=self._verification_status(),
+            verification_status=self.executor.verification_status,
+            verification_policy=self.completion_policy.minimum,
+            verification_evidence=self.executor.verification_evidence,
+            verification_records=[record.to_dict() for record in self.executor.verification_records],
             changed_files=sorted(self.executor.changed_files),
             history=history,
         )
 
-    def _verification_status(self) -> str:
-        if not self.executor.changed_files:
-            return "not_needed"
-        return "unverified" if self.executor.has_unverified_changes else "verified"
+    def _finish(
+        self,
+        *,
+        answer: str,
+        step: int,
+        stop_reason: str,
+        tool_call_count: int,
+        history: list[dict[str, Any]],
+    ) -> AgentResult:
+        self._emit(
+            {
+                "type": "final",
+                "step": step,
+                "answer": answer,
+                "stop_reason": stop_reason,
+                "verification_status": self.executor.verification_status,
+            }
+        )
+        return self._result(
+            answer=answer,
+            steps=step,
+            stop_reason=stop_reason,
+            tool_call_count=tool_call_count,
+            history=history,
+        )
 
     @staticmethod
     def _call_name(call: dict[str, Any]) -> str:
@@ -282,6 +394,9 @@ def save_transcript(path: str, result: AgentResult) -> None:
             "tool_calls": result.tool_calls,
             "stop_reason": result.stop_reason,
             "verification_status": result.verification_status,
+            "verification_policy": result.verification_policy,
+            "verification_evidence": result.verification_evidence,
+            "verification_records": result.verification_records,
             "changed_files": result.changed_files,
         }
         stream.write(json.dumps(summary, ensure_ascii=False) + "\n")

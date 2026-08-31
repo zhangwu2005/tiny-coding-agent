@@ -23,6 +23,17 @@ def main() -> int:
         help="stop after this many identical tool batches (default: 3)",
     )
     parser.add_argument("--auto-approve", action="store_true", help="approve run_command calls automatically")
+    parser.add_argument(
+        "--verification-policy",
+        choices=("none", "syntax", "test", "full"),
+        default="test",
+        help="minimum evidence required by the controller (default: test)",
+    )
+    parser.add_argument(
+        "--accept-incomplete",
+        action="store_true",
+        help="explicitly accept a completion proposal that does not satisfy the verification policy",
+    )
     parser.add_argument("--transcript", help="write the conversation as JSONL")
     args = parser.parse_args()
     task = args.task or input("Task: ").strip()
@@ -43,6 +54,21 @@ def main() -> int:
         answer = input(f"\nAgent requests command:\n  {command}\nApprove? [y/N] ").strip().lower()
         return answer in {"y", "yes"}
 
+    def approve_incomplete(review: dict[str, object]) -> bool:
+        if args.accept_incomplete:
+            print("[acceptance] incomplete result accepted by command-line user policy")
+            return True
+        evidence = ", ".join(str(item) for item in review["verification_evidence"]) or "none"
+        print(
+            "\n[user acceptance] The controller cannot approve this completion proposal.\n"
+            f"  reason: {review['reason']}\n"
+            f"  required policy: {review['verification_policy']}\n"
+            f"  current status: {review['verification_status']}\n"
+            f"  successful evidence: {evidence}"
+        )
+        answer = input("Type 'accept' to accept it anyway; anything else rejects: ").strip().lower()
+        return answer == "accept"
+
     def event(event_data: dict[str, object]) -> None:
         kind = event_data.get("type")
         if kind == "tool_call":
@@ -53,9 +79,14 @@ def main() -> int:
             print(f"[result]\n{event_data['result']}\n")
         elif kind == "verification_required":
             files = ", ".join(str(path) for path in event_data["changed_files"])
-            print(f"\n[self-check] verification requested for: {files}")
+            print(
+                f"\n[controller] completion rejected ({event_data['reason']}), "
+                f"policy={event_data['policy']}, files={files}"
+            )
         elif kind == "reflection_required":
             print(f"\n[reflection] verification failed: {event_data['command']}")
+        elif kind == "user_review_required":
+            print("\n[controller] insufficient evidence; handing the final decision to the user")
         elif kind == "stopped":
             print(f"\n[guard] stopped: {event_data['reason']}")
         elif kind == "final":
@@ -76,6 +107,8 @@ def main() -> int:
             executor,
             max_steps=args.max_steps,
             max_repeated_tool_batches=args.repeat_limit,
+            verification_policy=args.verification_policy,
+            approve_incomplete=approve_incomplete,
             on_event=event,
         ).run(task)
     except ProviderError as exc:
@@ -86,12 +119,21 @@ def main() -> int:
         f"\n[summary] stop_reason={result.stop_reason} "
         f"steps={result.steps} tool_calls={result.tool_calls} "
         f"verification={result.verification_status} "
+        f"policy={result.verification_policy} "
+        f"evidence={','.join(result.verification_evidence) or 'none'} "
+        f"records={len(result.verification_records)} "
         f"changed_files={len(result.changed_files)}"
     )
     if args.transcript:
         save_transcript(args.transcript, result)
         print(f"[transcript] {args.transcript}")
-    return 0
+    success_reasons = {
+        "completed_no_changes",
+        "completed_by_policy",
+        "completed_verified",
+        "user_accepted_incomplete",
+    }
+    return 0 if result.stop_reason in success_reasons else 2
 
 
 if __name__ == "__main__":

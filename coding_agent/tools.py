@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 from collections.abc import Iterator
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -42,17 +43,27 @@ MEDIUM_RISK_COMMAND_PATTERNS = (
     (re.compile(r"\bgit\s+push\b", re.IGNORECASE), "changes a remote repository"),
     (re.compile(r"\b(?:curl|wget|invoke-webrequest)\b", re.IGNORECASE), "uses the network"),
 )
-VERIFICATION_COMMAND_PATTERNS = (
-    re.compile(r"(?:^|[;&|]\s*)(?:python\s+-m\s+)?pytest\b", re.IGNORECASE),
-    re.compile(r"(?:^|[;&|]\s*)python\s+-m\s+unittest\b", re.IGNORECASE),
-    re.compile(r"(?:^|[;&|]\s*)python\s+-m\s+tests(?:\.[\w.-]+)*\b", re.IGNORECASE),
-    re.compile(r"(?:^|[;&|]\s*)python\s+[^;&|\r\n]*test[^;&|\r\n]*\.py\b", re.IGNORECASE),
-    re.compile(r"(?:^|[;&|]\s*)python\s+-m\s+compileall\b", re.IGNORECASE),
-    re.compile(r"(?:^|[;&|]\s*)(?:npm|pnpm|yarn)\s+(?:run\s+)?(?:test|lint|build)\b", re.IGNORECASE),
-    re.compile(r"(?:^|[;&|]\s*)cargo\s+(?:test|check|clippy)\b", re.IGNORECASE),
-    re.compile(r"(?:^|[;&|]\s*)(?:go|dotnet|mvn|gradle)\s+test\b", re.IGNORECASE),
-    re.compile(r"(?:^|[;&|]\s*)(?:ruff\s+check|mypy|pyright|eslint|tsc)\b", re.IGNORECASE),
-)
+VERIFICATION_STRENGTH = {
+    "syntax_only": 1,
+    "static_analysis": 1,
+    "targeted_test": 2,
+    "full_test_suite": 3,
+}
+
+
+@dataclass(frozen=True)
+class VerificationRecord:
+    """Evidence produced by one recognized check against one workspace version."""
+
+    command: str
+    verification_type: str
+    change_version: int
+    file_versions: dict[str, int]
+    exit_code: int | None
+    passed: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 class ToolError(RuntimeError):
@@ -74,7 +85,48 @@ def assess_command_risk(command: str) -> tuple[str, str]:
 
 def is_verification_command(command: str) -> bool:
     """Recognize common test/build checks without claiming that arbitrary commands verify code."""
-    return any(pattern.search(command) for pattern in VERIFICATION_COMMAND_PATTERNS)
+    return classify_verification_command(command) is not None
+
+
+def classify_verification_command(command: str) -> str | None:
+    """Classify a recognized check conservatively by the evidence it can provide."""
+    normalized = command.strip().casefold()
+    if re.search(r"(?:^|[;&|]\s*)python\s+-m\s+compileall\b", normalized):
+        return "syntax_only"
+    if re.search(
+        r"(?:^|[;&|]\s*)(?:ruff\s+check|mypy|pyright|eslint|tsc|cargo\s+(?:check|clippy))\b",
+        normalized,
+    ):
+        return "static_analysis"
+    if re.search(r"(?:^|[;&|]\s*)python\s+-m\s+tests(?:\.[\w.-]+)+\b", normalized):
+        return "targeted_test"
+    if re.search(r"(?:^|[;&|]\s*)python\s+[^;&|\r\n]*test[^;&|\r\n]*\.py\b", normalized):
+        return "targeted_test"
+
+    unittest_match = re.search(
+        r"(?:^|[;&|]\s*)python\s+-m\s+unittest\b(?P<tail>[^;&|\r\n]*)",
+        normalized,
+    )
+    if unittest_match:
+        tail = unittest_match.group("tail").strip()
+        return "full_test_suite" if not tail or tail.startswith("discover") else "targeted_test"
+
+    pytest_match = re.search(
+        r"(?:^|[;&|]\s*)(?:python\s+-m\s+)?pytest\b(?P<tail>[^;&|\r\n]*)",
+        normalized,
+    )
+    if pytest_match:
+        tail = pytest_match.group("tail")
+        has_target = bool(re.search(r"(?:\.py\b|::|(?:^|\s)(?:tests?[/\\]|\.?[/\\]))", tail))
+        return "targeted_test" if has_target else "full_test_suite"
+
+    if re.search(r"(?:^|[;&|]\s*)(?:npm|pnpm|yarn)\s+(?:run\s+)?(?:lint|build)\b", normalized):
+        return "static_analysis"
+    if re.search(r"(?:^|[;&|]\s*)(?:npm|pnpm|yarn)\s+(?:run\s+)?test\b", normalized):
+        return "full_test_suite"
+    if re.search(r"(?:^|[;&|]\s*)(?:cargo|go|dotnet|mvn|gradle)\s+test\b", normalized):
+        return "full_test_suite"
+    return None
 
 
 class ToolExecutor:
@@ -90,8 +142,9 @@ class ToolExecutor:
         self.approve_command = approve_command or (lambda _command: False)
         self.command_timeout = command_timeout
         self.change_version = 0
-        self.last_verified_version = 0
         self.changed_files: set[str] = set()
+        self.file_versions: dict[str, int] = {}
+        self.verification_records: list[VerificationRecord] = []
         self.observed_revisions: dict[str, str] = {}
         self.fully_observed_files: set[str] = set()
         self.verification_failure_version = 0
@@ -99,14 +152,77 @@ class ToolExecutor:
 
     @property
     def has_unverified_changes(self) -> bool:
-        return bool(self.changed_files) and (
-            self.change_version > self.last_verified_version
-            or self.last_verification_failure is not None
+        return bool(self.changed_files) and self.verification_status not in {
+            "verified",
+            "fully_verified",
+        }
+
+    @property
+    def current_verification_records(self) -> list[VerificationRecord]:
+        return [
+            record
+            for record in self.verification_records
+            if record.change_version == self.change_version
+        ]
+
+    @property
+    def strongest_current_verification_level(self) -> int:
+        return max(
+            (
+                VERIFICATION_STRENGTH[record.verification_type]
+                for record in self.current_verification_records
+                if record.passed
+            ),
+            default=0,
+        )
+
+    @property
+    def has_unresolved_verification_failure(self) -> bool:
+        records = self.current_verification_records
+        for index, record in enumerate(records):
+            if record.passed:
+                continue
+            failed_strength = VERIFICATION_STRENGTH[record.verification_type]
+            resolved = any(
+                later.passed
+                and VERIFICATION_STRENGTH[later.verification_type] >= failed_strength
+                for later in records[index + 1 :]
+            )
+            if not resolved:
+                return True
+        return False
+
+    @property
+    def verification_status(self) -> str:
+        if self.has_unresolved_verification_failure:
+            return "failed"
+        if not self.changed_files:
+            return "not_needed"
+        level = self.strongest_current_verification_level
+        return {
+            0: "unverified",
+            1: "partially_verified",
+            2: "verified",
+            3: "fully_verified",
+        }[level]
+
+    @property
+    def verification_evidence(self) -> list[str]:
+        return sorted(
+            {
+                record.verification_type
+                for record in self.current_verification_records
+                if record.passed
+            },
+            key=lambda item: (VERIFICATION_STRENGTH[item], item),
         )
 
     def _record_change(self, file_path: Path) -> None:
         self.change_version += 1
-        self.changed_files.add(file_path.relative_to(self.workspace).as_posix())
+        relative = file_path.relative_to(self.workspace).as_posix()
+        self.changed_files.add(relative)
+        self.file_versions[relative] = self.change_version
+        self.last_verification_failure = None
 
     @staticmethod
     def _file_revision(file_path: Path) -> str:
@@ -138,13 +254,36 @@ class ToolExecutor:
                 "use read_file for the whole file or make a precise replace_in_file edit"
             )
 
-    def _record_verification_failure(self, command: str, exit_code: str, output: str) -> None:
+    def _record_verification(
+        self,
+        command: str,
+        verification_type: str,
+        exit_code: int | None,
+        passed: bool,
+        output: str,
+    ) -> None:
+        self.verification_records.append(
+            VerificationRecord(
+                command=command,
+                verification_type=verification_type,
+                change_version=self.change_version,
+                file_versions=dict(self.file_versions),
+                exit_code=exit_code,
+                passed=passed,
+            )
+        )
+        if passed:
+            if not self.has_unresolved_verification_failure:
+                self.last_verification_failure = None
+            return
         nonempty_lines = [line.strip() for line in output.splitlines() if line.strip()]
         excerpt = "\n".join(nonempty_lines[-8:])[-1_200:] or "(no diagnostic output)"
         self.verification_failure_version += 1
         self.last_verification_failure = {
             "command": command,
-            "exit_code": exit_code,
+            "exit_code": "timeout" if exit_code is None else str(exit_code),
+            "verification_type": verification_type,
+            "change_version": self.change_version,
             "excerpt": excerpt,
             "changed_files": sorted(self.changed_files),
         }
@@ -320,7 +459,7 @@ class ToolExecutor:
         if not command.strip():
             raise ToolError("command is empty")
         risk_level, risk_reason = assess_command_risk(command)
-        verification = is_verification_command(command)
+        verification_type = classify_verification_command(command)
         if not self.approve_command(command):
             raise ToolError("command was not approved by the user")
         try:
@@ -335,26 +474,32 @@ class ToolExecutor:
             )
         except subprocess.TimeoutExpired as exc:
             output = (exc.stdout or "") + (exc.stderr or "")
-            if verification:
-                self._record_verification_failure(command, "timeout", output)
+            if verification_type:
+                self._record_verification(command, verification_type, None, False, output)
             return (
                 f"risk={risk_level} ({risk_reason})\n"
-                f"verification={'failed' if verification else 'not_recorded'}\n"
+                f"verification={'failed' if verification_type else 'not_recorded'}\n"
+                f"verification_type={verification_type or 'none'}\n"
+                f"change_version={self.change_version}\n"
                 f"command timed out after {self.command_timeout:g}s\n{output[-6000:]}"
             )
-        if completed.returncode == 0 and verification:
-            self.last_verified_version = self.change_version
-            self.last_verification_failure = None
         output = (completed.stdout + completed.stderr)[-12_000:]
-        if completed.returncode != 0 and verification:
-            self._record_verification_failure(command, str(completed.returncode), output)
-        if verification:
+        if verification_type:
+            self._record_verification(
+                command,
+                verification_type,
+                completed.returncode,
+                completed.returncode == 0,
+                output,
+            )
             verification_status = "passed" if completed.returncode == 0 else "failed"
         else:
             verification_status = "not_recorded"
         return (
             f"risk={risk_level} ({risk_reason})\n"
             f"verification={verification_status}\n"
+            f"verification_type={verification_type or 'none'}\n"
+            f"change_version={self.change_version}\n"
             f"exit_code={completed.returncode}\n{output}"
         ).rstrip()
 

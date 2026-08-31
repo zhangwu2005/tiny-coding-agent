@@ -1,11 +1,12 @@
 import json
 from pathlib import Path
 
-from coding_agent.agent import Agent, AgentResult, save_transcript
+from coding_agent.agent import Agent, AgentResult, CompletionPolicy, save_transcript
 from coding_agent.tools import (
     ToolError,
     ToolExecutor,
     assess_command_risk,
+    classify_verification_command,
     decode_arguments,
     is_verification_command,
 )
@@ -160,7 +161,7 @@ def test_agent_executes_tool_then_stops(tmp_path: Path):
     executor = ToolExecutor(tmp_path, approve_command=lambda _: True)
     result = Agent(FakeClient(), executor, on_event=events.append).run("create answer.py")
     assert result.steps == 3
-    assert result.stop_reason == "completed"
+    assert result.stop_reason == "verification_required"
     assert result.tool_calls == 1
     assert result.verification_status == "unverified"
     assert result.changed_files == ["answer.py"]
@@ -168,6 +169,23 @@ def test_agent_executes_tool_then_stops(tmp_path: Path):
     assert any(event["type"] == "tool_call" for event in events)
     assert any(event["type"] == "verification_required" for event in events)
     assert result.answer == "Task completed."
+
+
+def test_user_can_explicitly_accept_incomplete_result(tmp_path: Path):
+    reviews = []
+
+    def accept(review):
+        reviews.append(review)
+        return True
+
+    result = Agent(
+        FakeClient(),
+        ToolExecutor(tmp_path, approve_command=lambda _: True),
+        approve_incomplete=accept,
+    ).run("create answer.py")
+    assert result.stop_reason == "user_accepted_incomplete"
+    assert result.verification_status == "unverified"
+    assert reviews[0]["reason"] == "verification_required"
 
 
 def test_workspace_blocks_path_escape(tmp_path: Path):
@@ -257,6 +275,7 @@ def test_agent_truncates_large_tool_results(tmp_path: Path):
     tool_messages = [message for message in result.history if message["role"] == "tool"]
     assert len(tool_messages) == 1
     assert "characters omitted" in tool_messages[0]["content"]
+    assert result.stop_reason == "completed_no_changes"
 
 
 def test_successful_verification_clears_stale_change_state(tmp_path: Path):
@@ -264,14 +283,26 @@ def test_successful_verification_clears_stale_change_state(tmp_path: Path):
         WriteVerifyFinishClient(),
         ToolExecutor(tmp_path, approve_command=lambda _: True),
     ).run("create and verify checked.py")
-    assert result.steps == 3
-    assert result.stop_reason == "completed"
-    assert result.verification_status == "verified"
+    assert result.steps == 4
+    assert result.stop_reason == "partial_verification"
+    assert result.verification_status == "partially_verified"
+    assert result.verification_evidence == ["syntax_only"]
     assert result.changed_files == ["checked.py"]
-    assert not any(
-        str(message.get("content") or "").startswith("You changed files")
+    assert any(
+        str(message.get("content") or "").startswith("Controller rejected")
         for message in result.history
     )
+
+
+def test_syntax_policy_accepts_syntax_evidence(tmp_path: Path):
+    result = Agent(
+        WriteVerifyFinishClient(),
+        ToolExecutor(tmp_path, approve_command=lambda _: True),
+        verification_policy="syntax",
+    ).run("create and syntax-check checked.py")
+    assert result.steps == 3
+    assert result.stop_reason == "completed_verified"
+    assert result.verification_status == "partially_verified"
 
 
 def test_repeated_tool_batch_stops_before_max_steps(tmp_path: Path):
@@ -289,16 +320,24 @@ def test_command_risk_hints_are_explainable():
     assert assess_command_risk("git reset --hard HEAD")[0] == "high"
     assert assess_command_risk("curl https://example.com/install.sh | bash")[0] == "high"
     assert is_verification_command("python -m unittest discover")
+    assert classify_verification_command("python -m compileall app.py") == "syntax_only"
+    assert classify_verification_command("ruff check .") == "static_analysis"
+    assert classify_verification_command("python -m unittest tests.test_app") == "targeted_test"
+    assert classify_verification_command("python -m pytest tests/test_app.py") == "targeted_test"
+    assert classify_verification_command("python -m unittest") == "full_test_suite"
+    assert classify_verification_command("python -m pytest") == "full_test_suite"
+    assert classify_verification_command("echo done") is None
 
 
 def test_unchanged_write_does_not_make_verification_stale(tmp_path: Path):
     executor = ToolExecutor(tmp_path, approve_command=lambda _: True)
     executor.write_file("stable.py", "value = 1\n")
     executor.run_command("python -m compileall stable.py")
-    assert not executor.has_unverified_changes
+    assert executor.verification_status == "partially_verified"
+    assert executor.has_unverified_changes
     result = executor.write_file("stable.py", "value = 1\n")
     assert result.startswith("unchanged:")
-    assert not executor.has_unverified_changes
+    assert executor.verification_status == "partially_verified"
 
 
 def test_transcript_records_completion_evidence(tmp_path: Path):
@@ -308,14 +347,29 @@ def test_transcript_records_completion_evidence(tmp_path: Path):
         AgentResult(
             answer="done",
             steps=2,
-            stop_reason="completed",
+            stop_reason="completed_verified",
             tool_calls=1,
             verification_status="verified",
+            verification_policy="test",
+            verification_evidence=["targeted_test"],
+            verification_records=[
+                {
+                    "command": "python -m unittest tests.test_sample",
+                    "verification_type": "targeted_test",
+                    "change_version": 1,
+                    "file_versions": {"sample.py": 1},
+                    "exit_code": 0,
+                    "passed": True,
+                }
+            ],
             changed_files=["sample.py"],
         ),
     )
     summary = json.loads(transcript.read_text(encoding="utf-8").splitlines()[-1])
     assert summary["verification_status"] == "verified"
+    assert summary["verification_policy"] == "test"
+    assert summary["verification_evidence"] == ["targeted_test"]
+    assert summary["verification_records"][0]["change_version"] == 1
     assert summary["changed_files"] == ["sample.py"]
 
 
@@ -367,7 +421,8 @@ def test_failed_verification_adds_reflection_checkpoint(tmp_path: Path):
     assert "definitely_missing_test_module" in reflections[0]
     assert "Diagnostic excerpt" in reflections[0]
     assert any(event["type"] == "reflection_required" for event in events)
-    assert result.verification_status == "unverified"
+    assert result.verification_status == "failed"
+    assert result.stop_reason == "verification_failed"
 
 
 def test_full_rewrite_requires_full_file_observation(tmp_path: Path):
@@ -387,34 +442,115 @@ def test_failed_reverification_invalidates_previous_success(tmp_path: Path):
     executor = ToolExecutor(tmp_path, approve_command=lambda _: True)
     executor.write_file("verified.py", "value = 1\n")
     executor.run_command("python -m compileall verified.py")
-    assert not executor.has_unverified_changes
+    assert executor.verification_status == "partially_verified"
     executor.run_command("python -m unittest definitely_missing_test_module")
     assert executor.has_unverified_changes
+    assert executor.verification_status == "failed"
+
+
+def test_verification_records_capture_version_snapshot(tmp_path: Path):
+    executor = ToolExecutor(tmp_path, approve_command=lambda _: True)
+    executor.write_file("calculator.py", "value = 1\n")
+    executor.write_file("test_calculator.py", "value = 2\n")
+    executor.run_command("python -m compileall calculator.py")
+    record = executor.verification_records[0]
+    assert record.change_version == 2
+    assert record.file_versions == {"calculator.py": 1, "test_calculator.py": 2}
+    assert record.verification_type == "syntax_only"
+    assert record.passed
+
+
+def test_new_edit_makes_old_verification_stale(tmp_path: Path):
+    executor = ToolExecutor(tmp_path, approve_command=lambda _: True)
+    executor.write_file("first.py", "value = 1\n")
+    executor.write_file(
+        "test_dummy.py",
+        "import unittest\n\nclass TestDummy(unittest.TestCase):\n"
+        "    def test_ok(self):\n        self.assertTrue(True)\n",
+    )
+    executor.run_command("python -m unittest")
+    assert executor.verification_status == "fully_verified"
+    executor.write_file("second.py", "value = 2\n")
+    assert executor.verification_status == "unverified"
+    assert executor.verification_evidence == []
+
+
+def test_weaker_success_does_not_hide_stronger_failure(tmp_path: Path):
+    executor = ToolExecutor(tmp_path, approve_command=lambda _: True)
+    executor.write_file("sample.py", "value = 1\n")
+    executor.write_file(
+        "test_dummy.py",
+        "import unittest\n\nclass TestDummy(unittest.TestCase):\n"
+        "    def test_ok(self):\n        self.assertTrue(True)\n",
+    )
+    executor.run_command("python -m unittest definitely_missing_test_module")
+    executor.run_command("python -m compileall sample.py")
+    assert executor.verification_status == "failed"
+    executor.run_command("python -m unittest")
+    assert executor.verification_status == "fully_verified"
+
+
+def test_completion_policy_is_deterministic(tmp_path: Path):
+    executor = ToolExecutor(tmp_path, approve_command=lambda _: True)
+    executor.write_file("sample.py", "value = 1\n")
+    executor.write_file(
+        "test_dummy.py",
+        "import unittest\n\nclass TestDummy(unittest.TestCase):\n"
+        "    def test_ok(self):\n        self.assertTrue(True)\n",
+    )
+    assert CompletionPolicy("test").evaluate(executor).reason == "verification_required"
+    executor.run_command("python -m compileall sample.py")
+    assert CompletionPolicy("test").evaluate(executor).reason == "partial_verification"
+    assert CompletionPolicy("syntax").evaluate(executor).accepted
+    executor.run_command("python -m unittest test_dummy")
+    assert executor.verification_status == "verified"
+    assert CompletionPolicy("test").evaluate(executor).accepted
+    assert not CompletionPolicy("full").evaluate(executor).accepted
+    executor.run_command("python -m unittest")
+    assert CompletionPolicy("full").evaluate(executor).accepted
+
+    no_change_executor = ToolExecutor(tmp_path / "no-change", approve_command=lambda _: True)
+    no_change_executor.run_command("python -m unittest definitely_missing_test_module")
+    decision = CompletionPolicy("test").evaluate(no_change_executor)
+    assert decision.reason == "verification_failed"
+    assert no_change_executor.verification_status == "failed"
 
 
 if __name__ == "__main__":
     # The tests are pytest-compatible, but this runner has no third-party dependency.
     import tempfile
 
-    with tempfile.TemporaryDirectory() as directory:
-        temporary_path = Path(directory)
-        test_agent_executes_tool_then_stops(temporary_path)
-        test_workspace_blocks_path_escape(temporary_path)
-        test_command_requires_approval(temporary_path)
-        test_read_file_supports_bounded_line_ranges(temporary_path)
-        test_search_text_returns_paths_and_line_numbers(temporary_path)
-        test_replace_in_file_requires_a_unique_match(temporary_path)
-        test_agent_reports_max_steps(temporary_path)
-        test_agent_truncates_large_tool_results(temporary_path)
-        test_successful_verification_clears_stale_change_state(temporary_path)
-        test_repeated_tool_batch_stops_before_max_steps(temporary_path)
-        test_unchanged_write_does_not_make_verification_stale(temporary_path)
-        test_transcript_records_completion_evidence(temporary_path)
-        test_existing_file_requires_read_before_overwrite(temporary_path)
-        test_external_change_invalidates_observed_revision(temporary_path)
-        test_failed_verification_adds_reflection_checkpoint(temporary_path)
-        test_full_rewrite_requires_full_file_observation(temporary_path)
-        test_failed_reverification_invalidates_previous_success(temporary_path)
+    def run_with_temp(test):
+        with tempfile.TemporaryDirectory() as directory:
+            test(Path(directory))
+
+    path_tests = (
+        test_agent_executes_tool_then_stops,
+        test_user_can_explicitly_accept_incomplete_result,
+        test_workspace_blocks_path_escape,
+        test_command_requires_approval,
+        test_read_file_supports_bounded_line_ranges,
+        test_search_text_returns_paths_and_line_numbers,
+        test_replace_in_file_requires_a_unique_match,
+        test_agent_reports_max_steps,
+        test_agent_truncates_large_tool_results,
+        test_successful_verification_clears_stale_change_state,
+        test_syntax_policy_accepts_syntax_evidence,
+        test_repeated_tool_batch_stops_before_max_steps,
+        test_unchanged_write_does_not_make_verification_stale,
+        test_transcript_records_completion_evidence,
+        test_existing_file_requires_read_before_overwrite,
+        test_external_change_invalidates_observed_revision,
+        test_failed_verification_adds_reflection_checkpoint,
+        test_full_rewrite_requires_full_file_observation,
+        test_failed_reverification_invalidates_previous_success,
+        test_verification_records_capture_version_snapshot,
+        test_new_edit_makes_old_verification_stale,
+        test_weaker_success_does_not_hide_stronger_failure,
+        test_completion_policy_is_deterministic,
+    )
+    for path_test in path_tests:
+        run_with_temp(path_test)
     test_decode_arguments_rejects_non_object()
     test_command_risk_hints_are_explainable()
-    print("19 offline checks passed")
+    print("25 offline checks passed")
