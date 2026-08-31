@@ -13,7 +13,7 @@ Git 仓库：https://github.com/zhangwu2005/tiny-coding-agent
 
 测试
 python -m tests.test_agent
-共 28 项离线检查，无需 API Key 或第三方依赖。
+共 32 项离线检查，无需 API Key 或第三方依赖。
 
 特色
 项目不依赖 Agent 框架，自行实现模型 HTTP 请求、对话历史、上下文压缩、tool calling 解析、本地工具、循环终止和错误处理。七个工具支持结构化计划、目录浏览、分段读取、跨文件搜索、文件写入、唯一匹配替换和命令执行。

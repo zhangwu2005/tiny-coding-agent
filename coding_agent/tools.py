@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass
@@ -56,10 +57,15 @@ class VerificationRecord:
     """Evidence produced by one recognized check against one workspace version."""
 
     command: str
+    command_fingerprint: str
     verification_type: str
     change_version: int
     file_versions: dict[str, int]
     exit_code: int | None
+    tests_collected: int | None
+    agent_modified_test_files: list[str]
+    test_provenance_risk: str
+    failure_reason: str | None
     passed: bool
 
     def to_dict(self) -> dict[str, Any]:
@@ -86,6 +92,82 @@ def assess_command_risk(command: str) -> tuple[str, str]:
 def is_verification_command(command: str) -> bool:
     """Recognize common test/build checks without claiming that arbitrary commands verify code."""
     return classify_verification_command(command) is not None
+
+
+def command_fingerprint(command: str) -> str:
+    """Return a stable identity for semantically identical whitespace/case variants."""
+    normalized = " ".join(command.strip().split())
+    if os.name == "nt":
+        normalized = normalized.casefold()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def shell_control_operator(command: str) -> str | None:
+    """Find an unquoted shell composition/redirection operator."""
+    quote: str | None = None
+    escaped = False
+    for character in command:
+        if escaped:
+            escaped = False
+            continue
+        if character == "\\" and quote != "'":
+            escaped = True
+            continue
+        if quote is not None:
+            if character == quote:
+                quote = None
+            continue
+        if character in {'"', "'"}:
+            quote = character
+            continue
+        if character in ";&|<>\r\n":
+            return repr(character)
+    return None
+
+
+def parse_test_count(command: str, output: str) -> int | None:
+    """Extract a conservative test count from common runner summaries."""
+    normalized_command = command.casefold()
+    normalized_output = output.casefold()
+    if re.search(r"\b(?:no tests?|zero tests?)\s+(?:ran|collected|found)\b", normalized_output):
+        return 0
+
+    if "unittest" in normalized_command:
+        matches = re.findall(r"\bran\s+(\d+)\s+tests?\b", normalized_output)
+        return int(matches[-1]) if matches else None
+
+    if "pytest" in normalized_command:
+        collected = re.findall(r"\bcollected\s+(\d+)\s+items?\b", normalized_output)
+        if collected:
+            return int(collected[-1])
+        outcomes = re.findall(
+            r"\b(\d+)\s+(passed|failed|errors?|skipped|xfailed|xpassed)\b",
+            normalized_output,
+        )
+        return sum(int(count) for count, _outcome in outcomes) if outcomes else None
+
+    jest_total = re.findall(r"\btests:\s+[^\r\n]*?\b(\d+)\s+total\b", normalized_output)
+    if jest_total:
+        return int(jest_total[-1])
+    cargo_counts = re.findall(
+        r"\btest result:\s+\w+\.\s+(\d+)\s+passed;\s+(\d+)\s+failed",
+        normalized_output,
+    )
+    if cargo_counts:
+        passed, failed = cargo_counts[-1]
+        return int(passed) + int(failed)
+    return None
+
+
+def is_test_file(path: str) -> bool:
+    normalized = path.replace("\\", "/").casefold()
+    parts = normalized.split("/")
+    name = parts[-1]
+    return (
+        any(part in {"test", "tests", "__tests__"} for part in parts[:-1])
+        or name.startswith("test_")
+        or bool(re.search(r"(?:_test\.py|\.(?:test|spec)\.[^.]+)$", name))
+    )
 
 
 def classify_verification_command(command: str) -> str | None:
@@ -182,10 +264,9 @@ class ToolExecutor:
         for index, record in enumerate(records):
             if record.passed:
                 continue
-            failed_strength = VERIFICATION_STRENGTH[record.verification_type]
             resolved = any(
                 later.passed
-                and VERIFICATION_STRENGTH[later.verification_type] >= failed_strength
+                and later.command_fingerprint == record.command_fingerprint
                 for later in records[index + 1 :]
             )
             if not resolved:
@@ -261,21 +342,37 @@ class ToolExecutor:
         exit_code: int | None,
         passed: bool,
         output: str,
-    ) -> None:
-        self.verification_records.append(
-            VerificationRecord(
-                command=command,
-                verification_type=verification_type,
-                change_version=self.change_version,
-                file_versions=dict(self.file_versions),
-                exit_code=exit_code,
-                passed=passed,
+        *,
+        tests_collected: int | None = None,
+        failure_reason: str | None = None,
+    ) -> VerificationRecord:
+        modified_tests = sorted(path for path in self.changed_files if is_test_file(path))
+        if verification_type in {"targeted_test", "full_test_suite"}:
+            provenance_risk = (
+                "elevated_agent_modified_tests"
+                if modified_tests
+                else "normal_pre_existing_or_external_tests"
             )
+        else:
+            provenance_risk = "not_applicable"
+        record = VerificationRecord(
+            command=command,
+            command_fingerprint=command_fingerprint(command),
+            verification_type=verification_type,
+            change_version=self.change_version,
+            file_versions=dict(self.file_versions),
+            exit_code=exit_code,
+            tests_collected=tests_collected,
+            agent_modified_test_files=modified_tests,
+            test_provenance_risk=provenance_risk,
+            failure_reason=failure_reason,
+            passed=passed,
         )
+        self.verification_records.append(record)
         if passed:
             if not self.has_unresolved_verification_failure:
                 self.last_verification_failure = None
-            return
+            return record
         nonempty_lines = [line.strip() for line in output.splitlines() if line.strip()]
         excerpt = "\n".join(nonempty_lines[-8:])[-1_200:] or "(no diagnostic output)"
         self.verification_failure_version += 1
@@ -284,9 +381,13 @@ class ToolExecutor:
             "exit_code": "timeout" if exit_code is None else str(exit_code),
             "verification_type": verification_type,
             "change_version": self.change_version,
+            "failure_reason": failure_reason,
+            "tests_collected": tests_collected,
+            "test_provenance_risk": provenance_risk,
             "excerpt": excerpt,
             "changed_files": sorted(self.changed_files),
         }
+        return record
 
     def _path(self, raw: str) -> Path:
         if not raw or Path(raw).is_absolute():
@@ -460,13 +561,27 @@ class ToolExecutor:
             raise ToolError("command is empty")
         risk_level, risk_reason = assess_command_risk(command)
         verification_type = classify_verification_command(command)
+        if verification_type:
+            operator = shell_control_operator(command)
+            if operator is not None:
+                raise ToolError(
+                    "verification commands must be a single command without shell composition "
+                    f"or redirection; found {operator}"
+                )
         if not self.approve_command(command):
             raise ToolError("command was not approved by the user")
+        if verification_type and os.name != "nt":
+            try:
+                execution_command: str | list[str] = shlex.split(command)
+            except ValueError as exc:
+                raise ToolError(f"verification command has invalid quoting: {exc}") from exc
+        else:
+            execution_command = command
         try:
             completed = subprocess.run(
-                command,
+                execution_command,
                 cwd=self.workspace,
-                shell=True,
+                shell=verification_type is None,
                 capture_output=True,
                 text=True,
                 timeout=self.command_timeout,
@@ -475,30 +590,78 @@ class ToolExecutor:
         except subprocess.TimeoutExpired as exc:
             output = (exc.stdout or "") + (exc.stderr or "")
             if verification_type:
-                self._record_verification(command, verification_type, None, False, output)
+                tests_collected = (
+                    parse_test_count(command, output)
+                    if verification_type in {"targeted_test", "full_test_suite"}
+                    else None
+                )
+                record = self._record_verification(
+                    command,
+                    verification_type,
+                    None,
+                    False,
+                    output,
+                    tests_collected=tests_collected,
+                    failure_reason="timeout",
+                )
+                metadata = (
+                    f"tests_collected={record.tests_collected if record.tests_collected is not None else 'unknown'}\n"
+                    f"test_provenance_risk={record.test_provenance_risk}\n"
+                    f"agent_modified_test_files={','.join(record.agent_modified_test_files) or 'none'}\n"
+                    "failure_reason=timeout\n"
+                )
+            else:
+                metadata = ""
             return (
                 f"risk={risk_level} ({risk_reason})\n"
                 f"verification={'failed' if verification_type else 'not_recorded'}\n"
                 f"verification_type={verification_type or 'none'}\n"
+                f"{metadata}"
                 f"change_version={self.change_version}\n"
                 f"command timed out after {self.command_timeout:g}s\n{output[-6000:]}"
             )
         output = (completed.stdout + completed.stderr)[-12_000:]
         if verification_type:
-            self._record_verification(
+            tests_collected = (
+                parse_test_count(command, output)
+                if verification_type in {"targeted_test", "full_test_suite"}
+                else None
+            )
+            no_tests_collected = tests_collected == 0
+            passed = completed.returncode == 0 and not no_tests_collected
+            if no_tests_collected:
+                failure_reason = "no_tests_collected"
+            elif completed.returncode != 0:
+                failure_reason = "nonzero_exit"
+            else:
+                failure_reason = None
+            record = self._record_verification(
                 command,
                 verification_type,
                 completed.returncode,
-                completed.returncode == 0,
+                passed,
                 output,
+                tests_collected=tests_collected,
+                failure_reason=failure_reason,
             )
-            verification_status = "passed" if completed.returncode == 0 else "failed"
+            if no_tests_collected:
+                verification_status = "inconclusive"
+            else:
+                verification_status = "passed" if passed else "failed"
+            metadata = (
+                f"tests_collected={record.tests_collected if record.tests_collected is not None else 'unknown'}\n"
+                f"test_provenance_risk={record.test_provenance_risk}\n"
+                f"agent_modified_test_files={','.join(record.agent_modified_test_files) or 'none'}\n"
+                f"failure_reason={record.failure_reason or 'none'}\n"
+            )
         else:
             verification_status = "not_recorded"
+            metadata = ""
         return (
             f"risk={risk_level} ({risk_reason})\n"
             f"verification={verification_status}\n"
             f"verification_type={verification_type or 'none'}\n"
+            f"{metadata}"
             f"change_version={self.change_version}\n"
             f"exit_code={completed.returncode}\n{output}"
         ).rstrip()

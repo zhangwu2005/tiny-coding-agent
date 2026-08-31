@@ -9,8 +9,10 @@ from coding_agent.tools import (
     ToolExecutor,
     assess_command_risk,
     classify_verification_command,
+    command_fingerprint,
     decode_arguments,
     is_verification_command,
+    parse_test_count,
 )
 
 
@@ -388,6 +390,35 @@ def test_command_risk_hints_are_explainable():
     assert classify_verification_command("echo done") is None
 
 
+def test_verification_rejects_compound_shell_commands(tmp_path: Path):
+    executor = ToolExecutor(tmp_path, approve_command=lambda _: True)
+    for command in (
+        "python -m unittest; echo forged",
+        "python -m unittest && echo forged",
+        "python -m unittest || exit 0",
+        "python -m unittest > result.txt",
+    ):
+        try:
+            executor.run_command(command)
+        except ToolError as exc:
+            assert "single command" in str(exc)
+        else:
+            raise AssertionError(f"compound verification command was accepted: {command}")
+
+
+def test_zero_collected_tests_are_inconclusive(tmp_path: Path):
+    executor = ToolExecutor(tmp_path, approve_command=lambda _: True)
+    executor.write_file("test_empty.py", "# intentionally contains no tests\n")
+    result = executor.run_command("python -m unittest test_empty")
+    record = executor.verification_records[-1]
+    assert "verification=inconclusive" in result
+    assert record.tests_collected == 0
+    assert not record.passed
+    assert record.failure_reason == "no_tests_collected"
+    assert executor.verification_status == "failed"
+    assert parse_test_count("python -m pytest", "no tests ran in 0.01s") == 0
+
+
 def test_unchanged_write_does_not_make_verification_stale(tmp_path: Path):
     executor = ToolExecutor(tmp_path, approve_command=lambda _: True)
     executor.write_file("stable.py", "value = 1\n")
@@ -516,6 +547,9 @@ def test_verification_records_capture_version_snapshot(tmp_path: Path):
     assert record.change_version == 2
     assert record.file_versions == {"calculator.py": 1, "test_calculator.py": 2}
     assert record.verification_type == "syntax_only"
+    assert record.command_fingerprint == command_fingerprint("python -m compileall calculator.py")
+    assert record.agent_modified_test_files == ["test_calculator.py"]
+    assert record.test_provenance_risk == "not_applicable"
     assert record.passed
 
 
@@ -546,7 +580,57 @@ def test_weaker_success_does_not_hide_stronger_failure(tmp_path: Path):
     executor.run_command("python -m compileall sample.py")
     assert executor.verification_status == "failed"
     executor.run_command("python -m unittest")
-    assert executor.verification_status == "fully_verified"
+    assert executor.verification_status == "failed"
+
+
+def test_only_same_command_success_resolves_failure(tmp_path: Path):
+    executor = ToolExecutor(tmp_path, approve_command=lambda _: True)
+    failed_command = "python -m unittest test_retry"
+    executor._record_verification(
+        failed_command,
+        "targeted_test",
+        1,
+        False,
+        "FAILED",
+        tests_collected=1,
+        failure_reason="nonzero_exit",
+    )
+    executor._record_verification(
+        "python -m unittest",
+        "full_test_suite",
+        0,
+        True,
+        "Ran 1 test\nOK",
+        tests_collected=1,
+    )
+    assert executor.has_unresolved_verification_failure
+    executor._record_verification(
+        "  python   -m unittest   test_retry  ",
+        "targeted_test",
+        0,
+        True,
+        "Ran 1 test\nOK",
+        tests_collected=1,
+    )
+    assert not executor.has_unresolved_verification_failure
+
+
+def test_verification_marks_agent_modified_test_provenance(tmp_path: Path):
+    executor = ToolExecutor(tmp_path, approve_command=lambda _: True)
+    executor.write_file("calculator.py", "def add(a, b):\n    return a + b\n")
+    executor.write_file(
+        "test_calculator.py",
+        "import unittest\nfrom calculator import add\n\n"
+        "class TestAdd(unittest.TestCase):\n"
+        "    def test_add(self):\n        self.assertEqual(add(1, 2), 3)\n",
+    )
+    result = executor.run_command("python -m unittest test_calculator")
+    record = executor.verification_records[-1]
+    assert "tests_collected=1" in result
+    assert "test_provenance_risk=elevated_agent_modified_tests" in result
+    assert record.agent_modified_test_files == ["test_calculator.py"]
+    assert record.test_provenance_risk == "elevated_agent_modified_tests"
+    assert record.passed
 
 
 def test_completion_policy_is_deterministic(tmp_path: Path):
@@ -720,6 +804,8 @@ if __name__ == "__main__":
         test_syntax_policy_accepts_syntax_evidence,
         test_repeated_tool_batch_stops_before_max_steps,
         test_unchanged_write_does_not_make_verification_stale,
+        test_verification_rejects_compound_shell_commands,
+        test_zero_collected_tests_are_inconclusive,
         test_transcript_records_completion_evidence,
         test_existing_file_requires_read_before_overwrite,
         test_external_change_invalidates_observed_revision,
@@ -729,6 +815,8 @@ if __name__ == "__main__":
         test_verification_records_capture_version_snapshot,
         test_new_edit_makes_old_verification_stale,
         test_weaker_success_does_not_hide_stronger_failure,
+        test_only_same_command_success_resolves_failure,
+        test_verification_marks_agent_modified_test_provenance,
         test_completion_policy_is_deterministic,
         test_agent_executes_controller_owned_plan,
     )
@@ -738,4 +826,4 @@ if __name__ == "__main__":
     test_command_risk_hints_are_explainable()
     test_task_plan_requires_valid_transitions_and_action_evidence()
     test_context_manager_compacts_without_orphaning_tool_messages()
-    print("28 offline checks passed")
+    print("32 offline checks passed")

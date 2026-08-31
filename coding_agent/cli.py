@@ -140,6 +140,13 @@ def main() -> int:
         parser.exit(1, f"Model request failed: {exc}\n")
     except KeyboardInterrupt:
         parser.exit(130, "Interrupted. Check the API endpoint or use a compatible gateway, then try again.\n")
+    test_risks = sorted(
+        {
+            str(record["test_provenance_risk"])
+            for record in result.verification_records
+            if record.get("test_provenance_risk") not in {None, "not_applicable"}
+        }
+    )
     print(
         f"\n[summary] stop_reason={result.stop_reason} "
         f"steps={result.steps} tool_calls={result.tool_calls} "
@@ -147,6 +154,7 @@ def main() -> int:
         f"policy={result.verification_policy} "
         f"evidence={','.join(result.verification_evidence) or 'none'} "
         f"records={len(result.verification_records)} "
+        f"test_risk={','.join(test_risks) or 'none'} "
         f"plan_items={len(result.task_plan)} "
         f"context_compactions={result.context_compactions} "
         f"changed_files={len(result.changed_files)}"

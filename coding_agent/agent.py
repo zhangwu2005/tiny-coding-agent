@@ -25,6 +25,7 @@ Prefer replace_in_file for a precise edit when the old text occurs exactly once;
 Existing files are revision-guarded: read them before editing and re-read after any stale-observation error.
 For multi-step tasks, use update_plan before acting. Keep at most one item in_progress, update the plan after real work, and do not treat plan completion as a substitute for verification.
 Use tools for all file and command operations. Explain what you changed and verify it by running a relevant test.
+Use one verification command at a time without shell composition; a check that collects zero tests is inconclusive.
 Treat command execution as potentially destructive and use it only when it helps the task.
 When you believe the task is complete, stop and give a concise completion proposal; the controller decides whether the evidence is sufficient.
 Never include or request secrets."""
@@ -294,6 +295,9 @@ class Agent:
                     "then rerun verification.\n"
                     f"Command: {failure['command']}\n"
                     f"Exit: {failure['exit_code']}\n"
+                    f"Failure reason: {failure.get('failure_reason') or 'unknown'}\n"
+                    f"Tests collected: {failure.get('tests_collected')}\n"
+                    f"Test provenance risk: {failure.get('test_provenance_risk')}\n"
                     f"Changed files: {changed_files}\n"
                     f"Diagnostic excerpt:\n{failure['excerpt']}"
                 )
@@ -416,7 +420,11 @@ class Agent:
         if result.startswith("ERROR:"):
             return False
         if name == "run_command":
-            return "exit_code=0" in result and "verification=failed" not in result
+            return (
+                "exit_code=0" in result
+                and "verification=failed" not in result
+                and "verification=inconclusive" not in result
+            )
         return True
 
     def _context_state(self) -> dict[str, Any]:
@@ -427,6 +435,13 @@ class Agent:
             "file_versions": dict(self.executor.file_versions),
             "verification_status": self.executor.verification_status,
             "verification_evidence": self.executor.verification_evidence,
+            "test_provenance_risks": sorted(
+                {
+                    record.test_provenance_risk
+                    for record in self.executor.current_verification_records
+                    if record.test_provenance_risk != "not_applicable"
+                }
+            ),
             "last_verification_failure": self.executor.last_verification_failure,
         }
 

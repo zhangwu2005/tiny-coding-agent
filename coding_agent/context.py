@@ -77,10 +77,14 @@ class ContextManager:
                 "changed_file_count": len(state.get("changed_files") or []),
                 "verification_status": state.get("verification_status"),
                 "verification_evidence": state.get("verification_evidence") or [],
+                "test_provenance_risks": state.get("test_provenance_risks") or [],
                 "last_failure": (
                     {
                         "command": str(failure.get("command") or "")[:160],
                         "exit_code": failure.get("exit_code"),
+                        "failure_reason": failure.get("failure_reason"),
+                        "tests_collected": failure.get("tests_collected"),
+                        "test_provenance_risk": failure.get("test_provenance_risk"),
                         "excerpt": str(failure.get("excerpt") or "")[-200:],
                     }
                     if failure
@@ -123,10 +127,14 @@ class ContextManager:
             "file_versions_omitted": max(0, len(file_versions) - 10),
             "verification_status": state.get("verification_status"),
             "verification_evidence": state.get("verification_evidence") or [],
+            "test_provenance_risks": state.get("test_provenance_risks") or [],
             "last_verification_failure": (
                 {
                     "command": str(failure.get("command") or "")[:300],
                     "exit_code": failure.get("exit_code"),
+                    "failure_reason": failure.get("failure_reason"),
+                    "tests_collected": failure.get("tests_collected"),
+                    "test_provenance_risk": failure.get("test_provenance_risk"),
                     "excerpt": str(failure.get("excerpt") or "")[-500:],
                 }
                 if failure
