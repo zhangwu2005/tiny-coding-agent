@@ -17,6 +17,12 @@ def main() -> int:
     parser.add_argument("--workspace", default=".", help="workspace directory (default: current directory)")
     parser.add_argument("--max-steps", type=int, default=12, help="maximum model/tool rounds (default: 12)")
     parser.add_argument(
+        "--context-limit",
+        type=int,
+        default=60_000,
+        help="maximum approximate context characters sent to the model (default: 60000)",
+    )
+    parser.add_argument(
         "--repeat-limit",
         type=int,
         default=3,
@@ -83,6 +89,22 @@ def main() -> int:
                 f"\n[controller] completion rejected ({event_data['reason']}), "
                 f"policy={event_data['policy']}, files={files}"
             )
+        elif kind == "plan_required":
+            unfinished = [
+                f"{item['id']}={item['status']}"
+                for item in event_data["task_plan"]
+                if item["status"] != "completed"
+            ]
+            print(f"\n[controller] completion rejected; unfinished plan: {', '.join(unfinished)}")
+        elif kind == "plan_updated":
+            print("\n[plan]")
+            for item in event_data["task_plan"]:
+                print(f"  [{item['status']}] {item['id']}: {item['description']}")
+        elif kind == "context_compacted":
+            print(
+                f"\n[context] compacted {event_data['original_chars']} -> "
+                f"{event_data['sent_chars']} chars; omitted={event_data['omitted_messages']} messages"
+            )
         elif kind == "reflection_required":
             print(f"\n[reflection] verification failed: {event_data['command']}")
         elif kind == "user_review_required":
@@ -100,6 +122,8 @@ def main() -> int:
         parser.error("--max-steps must be positive")
     if args.repeat_limit < 2:
         parser.error("--repeat-limit must be at least 2")
+    if args.context_limit < 8_000:
+        parser.error("--context-limit must be at least 8000")
     executor = ToolExecutor(Path(args.workspace), approve_command=approve)
     try:
         result = Agent(
@@ -107,6 +131,7 @@ def main() -> int:
             executor,
             max_steps=args.max_steps,
             max_repeated_tool_batches=args.repeat_limit,
+            max_context_chars=args.context_limit,
             verification_policy=args.verification_policy,
             approve_incomplete=approve_incomplete,
             on_event=event,
@@ -122,6 +147,8 @@ def main() -> int:
         f"policy={result.verification_policy} "
         f"evidence={','.join(result.verification_evidence) or 'none'} "
         f"records={len(result.verification_records)} "
+        f"plan_items={len(result.task_plan)} "
+        f"context_compactions={result.context_compactions} "
         f"changed_files={len(result.changed_files)}"
     )
     if args.transcript:

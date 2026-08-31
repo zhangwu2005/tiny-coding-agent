@@ -2,6 +2,8 @@ import json
 from pathlib import Path
 
 from coding_agent.agent import Agent, AgentResult, CompletionPolicy, save_transcript
+from coding_agent.context import ContextManager
+from coding_agent.planning import PlanError, TaskPlan
 from coding_agent.tools import (
     ToolError,
     ToolExecutor,
@@ -154,6 +156,63 @@ class FailedVerificationClient:
                 ],
             }
         return {"role": "assistant", "content": "Verification could not be completed."}
+
+
+class PlanningClient:
+    def __init__(self):
+        self.calls = 0
+
+    @staticmethod
+    def _call(call_id, name, arguments):
+        return {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": json.dumps(arguments)},
+                }
+            ],
+        }
+
+    def complete(self, messages, tools):
+        self.calls += 1
+        initial = [
+            {"id": "inspect", "description": "Inspect workspace", "status": "in_progress"},
+            {"id": "implement", "description": "Create planned.py", "status": "pending"},
+            {"id": "verify", "description": "Compile planned.py", "status": "pending"},
+        ]
+        if self.calls == 1:
+            return self._call("plan-1", "update_plan", {"items": initial})
+        if self.calls == 2:
+            return self._call("list-1", "list_files", {"path": "."})
+        if self.calls == 3:
+            initial[0]["status"] = "completed"
+            initial[1]["status"] = "in_progress"
+            return self._call("plan-2", "update_plan", {"items": initial})
+        if self.calls == 4:
+            return self._call(
+                "write-1",
+                "write_file",
+                {"path": "planned.py", "content": "value = 42\n"},
+            )
+        if self.calls == 5:
+            initial[0]["status"] = "completed"
+            initial[1]["status"] = "completed"
+            initial[2]["status"] = "in_progress"
+            return self._call("plan-3", "update_plan", {"items": initial})
+        if self.calls == 6:
+            return self._call(
+                "verify-1",
+                "run_command",
+                {"command": "python -m compileall planned.py"},
+            )
+        if self.calls == 7:
+            for item in initial:
+                item["status"] = "completed"
+            return self._call("plan-4", "update_plan", {"items": initial})
+        return {"role": "assistant", "content": "Plan completed and code verified."}
 
 
 def test_agent_executes_tool_then_stops(tmp_path: Path):
@@ -509,11 +568,134 @@ def test_completion_policy_is_deterministic(tmp_path: Path):
     executor.run_command("python -m unittest")
     assert CompletionPolicy("full").evaluate(executor).accepted
 
+    unfinished_plan = TaskPlan()
+    unfinished_plan.apply_proposal(
+        [{"id": "review", "description": "Review result", "status": "in_progress"}]
+    )
+    plan_decision = CompletionPolicy("full").evaluate(executor, unfinished_plan)
+    assert plan_decision.reason == "plan_incomplete"
+
     no_change_executor = ToolExecutor(tmp_path / "no-change", approve_command=lambda _: True)
     no_change_executor.run_command("python -m unittest definitely_missing_test_module")
     decision = CompletionPolicy("test").evaluate(no_change_executor)
     assert decision.reason == "verification_failed"
     assert no_change_executor.verification_status == "failed"
+
+
+def test_task_plan_requires_valid_transitions_and_action_evidence():
+    plan = TaskPlan()
+    initial = [
+        {"id": "inspect", "description": "Inspect files", "status": "in_progress"},
+        {"id": "edit", "description": "Edit code", "status": "pending"},
+    ]
+    plan.apply_proposal(initial)
+    try:
+        plan.apply_proposal(
+            [
+                {"id": "inspect", "description": "Inspect files", "status": "completed"},
+                {"id": "edit", "description": "Edit code", "status": "in_progress"},
+            ]
+        )
+    except PlanError as exc:
+        assert "successful tool action" in str(exc)
+    else:
+        raise AssertionError("plan item completed without action evidence")
+
+    plan.record_action("read_file", "sample.py: lines 1-2")
+    plan.apply_proposal(
+        [
+            {"id": "inspect", "description": "Inspect files", "status": "completed"},
+            {"id": "edit", "description": "Edit code", "status": "in_progress"},
+        ]
+    )
+    assert plan.snapshot()[0]["evidence"]
+    assert not plan.is_complete
+
+    plan.record_action("replace_in_file", "replaced 1 occurrence")
+    plan.apply_proposal(
+        [
+            {"id": "inspect", "description": "Inspect files", "status": "completed"},
+            {"id": "edit", "description": "Edit code", "status": "completed"},
+        ]
+    )
+    assert plan.is_complete
+
+
+def test_context_manager_compacts_without_orphaning_tool_messages():
+    history = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "original task"},
+    ]
+    for number in range(12):
+        history.extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": f"call-{number}",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": f"call-{number}",
+                    "content": "x" * 700,
+                },
+            ]
+        )
+    history.append({"role": "assistant", "content": "latest conclusion"})
+    manager = ContextManager(max_chars=8_000)
+    compacted, metadata = manager.prepare(history, {"task_plan": [], "change_version": 3})
+    assert metadata is not None
+    assert metadata["omitted_messages"] > 0
+    assert len(json.dumps(compacted)) <= 8_000
+    assert compacted[0] == history[0]
+    assert compacted[1] == history[1]
+    assert "Controller context snapshot" in compacted[2]["content"]
+    assert compacted[-1]["content"] == "latest conclusion"
+    for index, message in enumerate(compacted):
+        if message["role"] == "tool":
+            assert index > 0
+            assert compacted[index - 1]["role"] == "assistant"
+            assert compacted[index - 1].get("tool_calls")
+
+    large_state = {
+        "task_plan": [
+            {
+                "id": f"item-{number}",
+                "description": "d" * 300,
+                "status": "pending",
+                "evidence": ["e"] * 10,
+            }
+            for number in range(20)
+        ],
+        "changed_files": ["p" * 250 for _ in range(100)],
+        "file_versions": {f"{'q' * 240}{number}": number for number in range(100)},
+    }
+    compacted_large, large_metadata = manager.prepare(history, large_state)
+    assert large_metadata is not None
+    assert len(json.dumps(compacted_large)) <= 8_000
+
+
+def test_agent_executes_controller_owned_plan(tmp_path: Path):
+    events = []
+    result = Agent(
+        PlanningClient(),
+        ToolExecutor(tmp_path, approve_command=lambda _: True),
+        verification_policy="syntax",
+        on_event=events.append,
+    ).run("create planned.py with a structured plan")
+    assert result.stop_reason == "completed_verified"
+    assert result.verification_status == "partially_verified"
+    assert result.tool_calls == 7
+    assert all(item["status"] == "completed" for item in result.task_plan)
+    assert all(item["evidence"] for item in result.task_plan)
+    assert any(event["type"] == "plan_updated" for event in events)
+    assert (tmp_path / "planned.py").read_text(encoding="utf-8") == "value = 42\n"
 
 
 if __name__ == "__main__":
@@ -548,9 +730,12 @@ if __name__ == "__main__":
         test_new_edit_makes_old_verification_stale,
         test_weaker_success_does_not_hide_stronger_failure,
         test_completion_policy_is_deterministic,
+        test_agent_executes_controller_owned_plan,
     )
     for path_test in path_tests:
         run_with_temp(path_test)
     test_decode_arguments_rejects_non_object()
     test_command_risk_hints_are_explainable()
-    print("25 offline checks passed")
+    test_task_plan_requires_valid_transitions_and_action_evidence()
+    test_context_manager_compacts_without_orphaning_tool_messages()
+    print("28 offline checks passed")

@@ -6,6 +6,8 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 
+from .context import ContextManager, DEFAULT_MAX_CONTEXT_CHARS
+from .planning import TaskPlan
 from .tools import TOOL_SCHEMAS, ToolError, ToolExecutor, decode_arguments
 
 
@@ -21,6 +23,7 @@ Work only inside the supplied workspace. Inspect existing files before changing 
 Use search_text and bounded read_file calls to gather only the context you need.
 Prefer replace_in_file for a precise edit when the old text occurs exactly once; use write_file for new files or full rewrites.
 Existing files are revision-guarded: read them before editing and re-read after any stale-observation error.
+For multi-step tasks, use update_plan before acting. Keep at most one item in_progress, update the plan after real work, and do not treat plan completion as a substitute for verification.
 Use tools for all file and command operations. Explain what you changed and verify it by running a relevant test.
 Treat command execution as potentially destructive and use it only when it helps the task.
 When you believe the task is complete, stop and give a concise completion proposal; the controller decides whether the evidence is sufficient.
@@ -46,11 +49,17 @@ class CompletionPolicy:
             raise ValueError(f"verification policy must be one of: {choices}")
         self.minimum = minimum
 
-    def evaluate(self, executor: ToolExecutor) -> CompletionDecision:
+    def evaluate(
+        self,
+        executor: ToolExecutor,
+        task_plan: TaskPlan | None = None,
+    ) -> CompletionDecision:
         status = executor.verification_status
         evidence = executor.verification_evidence
         if executor.has_unresolved_verification_failure:
             return CompletionDecision(False, "verification_failed", status, evidence)
+        if task_plan is not None and task_plan.exists and not task_plan.is_complete:
+            return CompletionDecision(False, "plan_incomplete", status, evidence)
         if not executor.changed_files:
             return CompletionDecision(True, "completed_no_changes", status, evidence)
 
@@ -73,6 +82,8 @@ class AgentResult:
     verification_evidence: list[str]
     verification_records: list[dict[str, Any]]
     changed_files: list[str]
+    task_plan: list[dict[str, Any]] = field(default_factory=list)
+    context_compactions: int = 0
     history: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -85,6 +96,7 @@ class Agent:
         max_steps: int = 12,
         max_tool_result_chars: int = DEFAULT_MAX_TOOL_RESULT_CHARS,
         max_repeated_tool_batches: int = 3,
+        max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
         verification_policy: str = "test",
         approve_incomplete: Callable[[dict[str, Any]], bool] | None = None,
         on_event: Any = None,
@@ -100,6 +112,7 @@ class Agent:
         self.max_steps = max_steps
         self.max_tool_result_chars = max_tool_result_chars
         self.max_repeated_tool_batches = max_repeated_tool_batches
+        self.max_context_chars = max_context_chars
         self.completion_policy = CompletionPolicy(verification_policy)
         self.approve_incomplete = approve_incomplete or (lambda _review: False)
         self.on_event = on_event or (lambda _event: None)
@@ -110,6 +123,8 @@ class Agent:
     def run(self, task: str) -> AgentResult:
         if not task.strip():
             raise ValueError("task is empty")
+        self.task_plan = TaskPlan()
+        self.context_manager = ContextManager(self.max_context_chars)
         history: list[dict[str, Any]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {
@@ -118,13 +133,19 @@ class Agent:
             },
         ]
         tool_call_count = 0
-        last_reminded_change_version = -1
+        last_reminded_state = ""
         previous_tool_batch = ""
         repeated_tool_batches = 0
         handled_failure_version = self.executor.verification_failure_version
         for step in range(1, self.max_steps + 1):
             self._emit({"type": "model_request", "step": step})
-            message = self.client.complete(history, TOOL_SCHEMAS)
+            model_history, compaction = self.context_manager.prepare(
+                history,
+                self._context_state(),
+            )
+            if compaction is not None:
+                self._emit({"type": "context_compacted", "step": step, **compaction})
+            message = self.client.complete(model_history, TOOL_SCHEMAS)
             assistant = {
                 "role": "assistant",
                 "content": message.get("content"),
@@ -137,7 +158,7 @@ class Agent:
                 assistant["tool_calls"] = tool_calls
             history.append(assistant)
             if not tool_calls:
-                decision = self.completion_policy.evaluate(self.executor)
+                decision = self.completion_policy.evaluate(self.executor, self.task_plan)
                 if decision.accepted:
                     return self._finish(
                         answer=str(message.get("content") or "(model returned no final answer)"),
@@ -146,26 +167,24 @@ class Agent:
                         tool_call_count=tool_call_count,
                         history=history,
                     )
-                if self.executor.change_version > last_reminded_change_version and step < self.max_steps:
+                current_state = self._completion_state_signature()
+                if current_state != last_reminded_state and step < self.max_steps:
                     changed_files = sorted(self.executor.changed_files)
                     evidence = ", ".join(decision.evidence) or "none"
-                    reminder = (
-                        "Controller rejected the completion proposal because its deterministic "
-                        f"verification policy is '{self.completion_policy.minimum}'. "
-                        f"Reason: {decision.reason}; current evidence: {evidence}. "
-                        "Run a sufficiently strong relevant check if possible. If that is impossible, "
-                        "explain the limitation in the next completion proposal. Changed files: "
-                        + (", ".join(changed_files) or "(none)")
-                    )
+                    reminder = self._completion_reminder(decision, changed_files, evidence)
                     history.append({"role": "user", "content": reminder})
-                    last_reminded_change_version = self.executor.change_version
+                    last_reminded_state = current_state
+                    event_type = (
+                        "plan_required" if decision.reason == "plan_incomplete" else "verification_required"
+                    )
                     self._emit(
                         {
-                            "type": "verification_required",
+                            "type": event_type,
                             "step": step,
                             "reason": decision.reason,
                             "policy": self.completion_policy.minimum,
                             "evidence": decision.evidence,
+                            "task_plan": self.task_plan.snapshot(),
                             "changed_files": changed_files,
                         }
                     )
@@ -180,6 +199,7 @@ class Agent:
                     "verification_status": decision.verification_status,
                     "verification_evidence": decision.evidence,
                     "changed_files": sorted(self.executor.changed_files),
+                    "task_plan": self.task_plan.snapshot(),
                 }
                 self._emit(
                     {
@@ -322,6 +342,8 @@ class Agent:
             verification_evidence=self.executor.verification_evidence,
             verification_records=[record.to_dict() for record in self.executor.verification_records],
             changed_files=sorted(self.executor.changed_files),
+            task_plan=self.task_plan.snapshot(),
+            context_compactions=self.context_manager.compaction_count,
             history=history,
         )
 
@@ -375,13 +397,65 @@ class Agent:
         try:
             arguments = decode_arguments(function.get("arguments", call.get("arguments", {})))
             self._emit({"type": "tool_call", "name": name, "arguments": arguments})
-            result = self.executor.call(name, arguments)
+            if name == "update_plan":
+                result = self.task_plan.apply_proposal(arguments.get("items"))
+                self._emit({"type": "plan_updated", "task_plan": self.task_plan.snapshot()})
+            else:
+                result = self.executor.call(name, arguments)
+                if self._tool_result_succeeded(name, result):
+                    self.task_plan.record_action(name, result)
             if len(result) <= self.max_tool_result_chars:
                 return result
             omitted = len(result) - self.max_tool_result_chars
             return result[: self.max_tool_result_chars] + f"\n... ({omitted} characters omitted)"
         except (ToolError, ValueError, TypeError) as exc:
             return f"ERROR: {exc}"
+
+    @staticmethod
+    def _tool_result_succeeded(name: str, result: str) -> bool:
+        if result.startswith("ERROR:"):
+            return False
+        if name == "run_command":
+            return "exit_code=0" in result and "verification=failed" not in result
+        return True
+
+    def _context_state(self) -> dict[str, Any]:
+        return {
+            "task_plan": self.task_plan.snapshot(),
+            "change_version": self.executor.change_version,
+            "changed_files": sorted(self.executor.changed_files),
+            "file_versions": dict(self.executor.file_versions),
+            "verification_status": self.executor.verification_status,
+            "verification_evidence": self.executor.verification_evidence,
+            "last_verification_failure": self.executor.last_verification_failure,
+        }
+
+    def _completion_state_signature(self) -> str:
+        return json.dumps(self._context_state(), ensure_ascii=False, sort_keys=True)
+
+    def _completion_reminder(
+        self,
+        decision: CompletionDecision,
+        changed_files: list[str],
+        evidence: str,
+    ) -> str:
+        if decision.reason == "plan_incomplete":
+            unfinished = ", ".join(
+                f"{item.id}={item.status}" for item in self.task_plan.unfinished_items
+            )
+            return (
+                "Controller rejected the completion proposal because the structured task plan "
+                f"is incomplete: {unfinished}. Continue the current item, perform real tool work, "
+                "then call update_plan with valid state transitions."
+            )
+        return (
+            "Controller rejected the completion proposal because its deterministic "
+            f"verification policy is '{self.completion_policy.minimum}'. "
+            f"Reason: {decision.reason}; current evidence: {evidence}. "
+            "Run a sufficiently strong relevant check if possible. If that is impossible, "
+            "explain the limitation in the next completion proposal. Changed files: "
+            + (", ".join(changed_files) or "(none)")
+        )
 
 
 def save_transcript(path: str, result: AgentResult) -> None:
@@ -398,5 +472,7 @@ def save_transcript(path: str, result: AgentResult) -> None:
             "verification_evidence": result.verification_evidence,
             "verification_records": result.verification_records,
             "changed_files": result.changed_files,
+            "task_plan": result.task_plan,
+            "context_compactions": result.context_compactions,
         }
         stream.write(json.dumps(summary, ensure_ascii=False) + "\n")
