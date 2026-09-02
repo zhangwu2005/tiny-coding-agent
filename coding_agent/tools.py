@@ -50,6 +50,7 @@ VERIFICATION_STRENGTH = {
     "targeted_test": 2,
     "full_test_suite": 3,
 }
+TEST_PROVENANCE_POLICIES = {"allow", "warn", "independent"}
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,7 @@ class VerificationRecord:
     verification_type: str
     change_version: int
     file_versions: dict[str, int]
+    file_roles: dict[str, str]
     exit_code: int | None
     tests_collected: int | None
     agent_modified_test_files: list[str]
@@ -170,6 +172,29 @@ def is_test_file(path: str) -> bool:
     )
 
 
+def classify_file_role(path: str) -> str:
+    """Classify a changed file by its project role using deterministic path rules."""
+    normalized = path.replace("\\", "/").casefold()
+    name = normalized.rsplit("/", 1)[-1]
+    if is_test_file(path):
+        return "test"
+    if name in {"readme", "license", "changelog", "contributing"} or name.startswith(
+        ("readme.", "license.", "changelog.", "contributing.")
+    ):
+        return "documentation"
+    if name in {
+        "pyproject.toml",
+        "setup.cfg",
+        "setup.py",
+        "tox.ini",
+        "package.json",
+        "package-lock.json",
+        "requirements.txt",
+    } or name.endswith((".ini", ".toml", ".yaml", ".yml")):
+        return "configuration"
+    return "implementation"
+
+
 def classify_verification_command(command: str) -> str | None:
     """Classify a recognized check conservatively by the evidence it can provide."""
     normalized = command.strip().casefold()
@@ -226,6 +251,7 @@ class ToolExecutor:
         self.change_version = 0
         self.changed_files: set[str] = set()
         self.file_versions: dict[str, int] = {}
+        self.file_roles: dict[str, str] = {}
         self.verification_records: list[VerificationRecord] = []
         self.observed_revisions: dict[str, str] = {}
         self.fully_observed_files: set[str] = set()
@@ -254,6 +280,17 @@ class ToolExecutor:
                 VERIFICATION_STRENGTH[record.verification_type]
                 for record in self.current_verification_records
                 if record.passed
+            ),
+            default=0,
+        )
+
+    def strongest_verification_level_for_provenance(self, policy: str) -> int:
+        """Return the strongest successful evidence allowed by a provenance policy."""
+        return max(
+            (
+                VERIFICATION_STRENGTH[record.verification_type]
+                for record in self.current_verification_records
+                if record.passed and self._record_allowed_by_provenance(record, policy)
             ),
             default=0,
         )
@@ -298,11 +335,37 @@ class ToolExecutor:
             key=lambda item: (VERIFICATION_STRENGTH[item], item),
         )
 
+    def verification_evidence_for_provenance(self, policy: str) -> list[str]:
+        """List successful evidence that is eligible under a provenance policy."""
+        if policy not in TEST_PROVENANCE_POLICIES:
+            choices = ", ".join(sorted(TEST_PROVENANCE_POLICIES))
+            raise ValueError(f"test provenance policy must be one of: {choices}")
+        return sorted(
+            {
+                record.verification_type
+                for record in self.current_verification_records
+                if record.passed and self._record_allowed_by_provenance(record, policy)
+            },
+            key=lambda item: (VERIFICATION_STRENGTH[item], item),
+        )
+
+    @staticmethod
+    def _record_allowed_by_provenance(record: VerificationRecord, policy: str) -> bool:
+        if policy not in TEST_PROVENANCE_POLICIES:
+            choices = ", ".join(sorted(TEST_PROVENANCE_POLICIES))
+            raise ValueError(f"test provenance policy must be one of: {choices}")
+        return not (
+            policy == "independent"
+            and record.verification_type in {"targeted_test", "full_test_suite"}
+            and record.test_provenance_risk == "elevated_agent_modified_tests"
+        )
+
     def _record_change(self, file_path: Path) -> None:
         self.change_version += 1
         relative = file_path.relative_to(self.workspace).as_posix()
         self.changed_files.add(relative)
         self.file_versions[relative] = self.change_version
+        self.file_roles[relative] = classify_file_role(relative)
         self.last_verification_failure = None
 
     @staticmethod
@@ -348,12 +411,18 @@ class ToolExecutor:
     ) -> VerificationRecord:
         modified_tests = sorted(path for path in self.changed_files if is_test_file(path))
         if verification_type in {"targeted_test", "full_test_suite"}:
+            referenced_modified_tests = self._modified_tests_relevant_to_command(
+                command,
+                verification_type,
+                modified_tests,
+            )
             provenance_risk = (
                 "elevated_agent_modified_tests"
-                if modified_tests
+                if referenced_modified_tests
                 else "normal_pre_existing_or_external_tests"
             )
         else:
+            referenced_modified_tests = modified_tests
             provenance_risk = "not_applicable"
         record = VerificationRecord(
             command=command,
@@ -361,9 +430,10 @@ class ToolExecutor:
             verification_type=verification_type,
             change_version=self.change_version,
             file_versions=dict(self.file_versions),
+            file_roles=dict(self.file_roles),
             exit_code=exit_code,
             tests_collected=tests_collected,
-            agent_modified_test_files=modified_tests,
+            agent_modified_test_files=referenced_modified_tests,
             test_provenance_risk=provenance_risk,
             failure_reason=failure_reason,
             passed=passed,
@@ -384,10 +454,36 @@ class ToolExecutor:
             "failure_reason": failure_reason,
             "tests_collected": tests_collected,
             "test_provenance_risk": provenance_risk,
+            "file_roles": dict(self.file_roles),
             "excerpt": excerpt,
             "changed_files": sorted(self.changed_files),
         }
         return record
+
+    @staticmethod
+    def _modified_tests_relevant_to_command(
+        command: str,
+        verification_type: str,
+        modified_tests: list[str],
+    ) -> list[str]:
+        """Conservatively associate changed test files with a test command."""
+        if verification_type == "full_test_suite":
+            return modified_tests
+        normalized_command = command.replace("\\", "/").casefold()
+        relevant: list[str] = []
+        for path in modified_tests:
+            normalized_path = path.replace("\\", "/").casefold()
+            module = normalized_path.rsplit(".", 1)[0].replace("/", ".")
+            stem = Path(normalized_path).stem
+            parent = normalized_path.rsplit("/", 1)[0] if "/" in normalized_path else ""
+            if (
+                normalized_path in normalized_command
+                or module in normalized_command
+                or re.search(rf"(?<![\w.]){re.escape(stem)}(?![\w.])", normalized_command)
+                or (parent and re.search(rf"(?:^|\s){re.escape(parent)}(?:/|\s|$)", normalized_command))
+            ):
+                relevant.append(path)
+        return relevant
 
     def _path(self, raw: str) -> Path:
         if not raw or Path(raw).is_absolute():
@@ -525,7 +621,8 @@ class ToolExecutor:
         self._record_change(file_path)
         action = "created" if previous_content is None else "updated"
         return (
-            f"{action} {relative} ({len(encoded_content)} bytes, revision={revision[:12]}); "
+            f"{action} {relative} ({len(encoded_content)} bytes, revision={revision[:12]}, "
+            f"role={self.file_roles[relative]}); "
             "verification is now stale"
         )
 
@@ -552,7 +649,8 @@ class ToolExecutor:
         revision = self._remember_revision(file_path)
         self._record_change(file_path)
         return (
-            f"replaced 1 occurrence in {relative} (revision={revision[:12]}); "
+            f"replaced 1 occurrence in {relative} (revision={revision[:12]}, "
+            f"role={self.file_roles[relative]}); "
             "verification is now stale"
         )
 
@@ -577,6 +675,9 @@ class ToolExecutor:
                 raise ToolError(f"verification command has invalid quoting: {exc}") from exc
         else:
             execution_command = command
+        changed_file_roles = ",".join(
+            f"{path}:{role}" for path, role in sorted(self.file_roles.items())
+        ) or "none"
         try:
             completed = subprocess.run(
                 execution_command,
@@ -618,6 +719,7 @@ class ToolExecutor:
                 f"verification_type={verification_type or 'none'}\n"
                 f"{metadata}"
                 f"change_version={self.change_version}\n"
+                f"changed_file_roles={changed_file_roles}\n"
                 f"command timed out after {self.command_timeout:g}s\n{output[-6000:]}"
             )
         output = (completed.stdout + completed.stderr)[-12_000:]
@@ -663,6 +765,7 @@ class ToolExecutor:
             f"verification_type={verification_type or 'none'}\n"
             f"{metadata}"
             f"change_version={self.change_version}\n"
+            f"changed_file_roles={changed_file_roles}\n"
             f"exit_code={completed.returncode}\n{output}"
         ).rstrip()
 

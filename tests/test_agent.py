@@ -1,13 +1,17 @@
+import contextlib
+import io
 import json
 from pathlib import Path
 
 from coding_agent.agent import Agent, AgentResult, CompletionPolicy, save_transcript
 from coding_agent.context import ContextManager
+from coding_agent.demo import main as demo_main
 from coding_agent.planning import PlanError, TaskPlan
 from coding_agent.tools import (
     ToolError,
     ToolExecutor,
     assess_command_risk,
+    classify_file_role,
     classify_verification_command,
     command_fingerprint,
     decode_arguments,
@@ -633,6 +637,61 @@ def test_verification_marks_agent_modified_test_provenance(tmp_path: Path):
     assert record.passed
 
 
+def test_changed_files_are_classified_by_role(tmp_path: Path):
+    executor = ToolExecutor(tmp_path)
+    executor.write_file("calculator.py", "def add(a, b):\n    return a + b\n")
+    executor.write_file("tests/test_calculator.py", "# test support\n")
+    executor.write_file("README.md", "# Calculator\n")
+    executor.write_file("pyproject.toml", "[project]\nname = 'calculator'\n")
+    assert executor.change_version == 4
+    assert executor.file_roles == {
+        "calculator.py": "implementation",
+        "tests/test_calculator.py": "test",
+        "README.md": "documentation",
+        "pyproject.toml": "configuration",
+    }
+    assert classify_file_role("src/math_test.py") == "test"
+
+
+def test_provenance_policy_requires_independent_test_evidence(tmp_path: Path):
+    self_test_workspace = tmp_path / "self-test"
+    executor = ToolExecutor(self_test_workspace, approve_command=lambda _: True)
+    executor.write_file("calculator.py", "def add(a, b):\n    return a + b\n")
+    executor.write_file(
+        "test_calculator.py",
+        "import unittest\nfrom calculator import add\n\n"
+        "class TestAdd(unittest.TestCase):\n"
+        "    def test_add(self):\n        self.assertEqual(add(1, 2), 3)\n",
+    )
+    executor.run_command("python -m unittest test_calculator")
+    assert CompletionPolicy("test", "warn").evaluate(executor).accepted
+    strict_decision = CompletionPolicy("test", "independent").evaluate(executor)
+    assert not strict_decision.accepted
+    assert strict_decision.reason == "independent_test_required"
+    assert strict_decision.evidence == ["targeted_test"]
+    assert strict_decision.eligible_evidence == []
+
+    independent_workspace = tmp_path / "independent"
+    independent_workspace.mkdir()
+    (independent_workspace / "test_existing.py").write_text(
+        "import unittest\nfrom calculator import add\n\n"
+        "class TestExisting(unittest.TestCase):\n"
+        "    def test_add(self):\n        self.assertEqual(add(1, 2), 3)\n",
+        encoding="utf-8",
+    )
+    independent_executor = ToolExecutor(
+        independent_workspace,
+        approve_command=lambda _: True,
+    )
+    independent_executor.write_file("calculator.py", "def add(a, b):\n    return a + b\n")
+    independent_executor.write_file("test_generated.py", "# Agent-created test support\n")
+    independent_executor.run_command("python -m unittest test_existing")
+    record = independent_executor.verification_records[-1]
+    assert record.test_provenance_risk == "normal_pre_existing_or_external_tests"
+    assert record.agent_modified_test_files == []
+    assert CompletionPolicy("test", "independent").evaluate(independent_executor).accepted
+
+
 def test_completion_policy_is_deterministic(tmp_path: Path):
     executor = ToolExecutor(tmp_path, approve_command=lambda _: True)
     executor.write_file("sample.py", "value = 1\n")
@@ -782,6 +841,26 @@ def test_agent_executes_controller_owned_plan(tmp_path: Path):
     assert (tmp_path / "planned.py").read_text(encoding="utf-8") == "value = 42\n"
 
 
+def test_offline_demo_runs_all_scenarios():
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        assert demo_main(["all"]) == 0
+    rendered = output.getvalue()
+    assert "控制器已拒绝" in rendered
+    assert "最终验证状态：failed" in rendered
+    assert "相同命令成功重跑后：fully_verified" in rendered
+    assert "elevated_agent_modified_tests" in rendered
+    assert "independent 策略允许结束：False (independent_test_required)" in rendered
+    assert "再次修改后：version=3, status=unverified" in rendered
+    assert "没有工具证据时，控制器拒绝" in rendered
+    assert "最新结论是否保留：最新结论必须被保留" in rendered
+    assert "=== 案例：库存原子预占 ===" in rendered
+    assert "FAILED (failures=7, errors=1)" in rendered
+    assert "stop_reason=completed_verified" in rendered
+    assert "same_failed_command_retried=True" in rendered
+    assert "acceptance_test_unchanged=True" in rendered
+
+
 if __name__ == "__main__":
     # The tests are pytest-compatible, but this runner has no third-party dependency.
     import tempfile
@@ -817,6 +896,8 @@ if __name__ == "__main__":
         test_weaker_success_does_not_hide_stronger_failure,
         test_only_same_command_success_resolves_failure,
         test_verification_marks_agent_modified_test_provenance,
+        test_changed_files_are_classified_by_role,
+        test_provenance_policy_requires_independent_test_evidence,
         test_completion_policy_is_deterministic,
         test_agent_executes_controller_owned_plan,
     )
@@ -826,4 +907,5 @@ if __name__ == "__main__":
     test_command_risk_hints_are_explainable()
     test_task_plan_requires_valid_transitions_and_action_evidence()
     test_context_manager_compacts_without_orphaning_tool_messages()
-    print("32 offline checks passed")
+    test_offline_demo_runs_all_scenarios()
+    print("35 offline checks passed")

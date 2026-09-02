@@ -8,7 +8,13 @@ from typing import Any, Callable, Protocol
 
 from .context import ContextManager, DEFAULT_MAX_CONTEXT_CHARS
 from .planning import TaskPlan
-from .tools import TOOL_SCHEMAS, ToolError, ToolExecutor, decode_arguments
+from .tools import (
+    TEST_PROVENANCE_POLICIES,
+    TOOL_SCHEMAS,
+    ToolError,
+    ToolExecutor,
+    decode_arguments,
+)
 
 
 DEFAULT_MAX_TOOL_RESULT_CHARS = 20_000
@@ -26,6 +32,7 @@ Existing files are revision-guarded: read them before editing and re-read after 
 For multi-step tasks, use update_plan before acting. Keep at most one item in_progress, update the plan after real work, and do not treat plan completion as a substitute for verification.
 Use tools for all file and command operations. Explain what you changed and verify it by running a relevant test.
 Use one verification command at a time without shell composition; a check that collects zero tests is inconclusive.
+Tests changed during this agent run are provenance-sensitive and may not satisfy an independent-test policy.
 Treat command execution as potentially destructive and use it only when it helps the task.
 When you believe the task is complete, stop and give a concise completion proposal; the controller decides whether the evidence is sufficient.
 Never include or request secrets."""
@@ -39,16 +46,21 @@ class CompletionDecision:
     reason: str
     verification_status: str
     evidence: list[str]
+    eligible_evidence: list[str]
 
 
 class CompletionPolicy:
     """Deterministic controller policy; the model cannot waive these requirements."""
 
-    def __init__(self, minimum: str = "test") -> None:
+    def __init__(self, minimum: str = "test", test_provenance_policy: str = "warn") -> None:
         if minimum not in VERIFICATION_POLICY_LEVELS:
             choices = ", ".join(VERIFICATION_POLICY_LEVELS)
             raise ValueError(f"verification policy must be one of: {choices}")
+        if test_provenance_policy not in TEST_PROVENANCE_POLICIES:
+            choices = ", ".join(sorted(TEST_PROVENANCE_POLICIES))
+            raise ValueError(f"test provenance policy must be one of: {choices}")
         self.minimum = minimum
+        self.test_provenance_policy = test_provenance_policy
 
     def evaluate(
         self,
@@ -57,19 +69,35 @@ class CompletionPolicy:
     ) -> CompletionDecision:
         status = executor.verification_status
         evidence = executor.verification_evidence
+        eligible_evidence = executor.verification_evidence_for_provenance(
+            self.test_provenance_policy
+        )
         if executor.has_unresolved_verification_failure:
-            return CompletionDecision(False, "verification_failed", status, evidence)
+            return CompletionDecision(
+                False, "verification_failed", status, evidence, eligible_evidence
+            )
         if task_plan is not None and task_plan.exists and not task_plan.is_complete:
-            return CompletionDecision(False, "plan_incomplete", status, evidence)
+            return CompletionDecision(False, "plan_incomplete", status, evidence, eligible_evidence)
         if not executor.changed_files:
-            return CompletionDecision(True, "completed_no_changes", status, evidence)
+            return CompletionDecision(
+                True, "completed_no_changes", status, evidence, eligible_evidence
+            )
 
         required_level = VERIFICATION_POLICY_LEVELS[self.minimum]
-        if executor.strongest_current_verification_level >= required_level:
+        eligible_level = executor.strongest_verification_level_for_provenance(
+            self.test_provenance_policy
+        )
+        if eligible_level >= required_level:
             reason = "completed_by_policy" if required_level == 0 else "completed_verified"
-            return CompletionDecision(True, reason, status, evidence)
-        reason = "partial_verification" if evidence else "verification_required"
-        return CompletionDecision(False, reason, status, evidence)
+            return CompletionDecision(True, reason, status, evidence, eligible_evidence)
+        if (
+            self.test_provenance_policy == "independent"
+            and executor.strongest_current_verification_level >= required_level
+        ):
+            reason = "independent_test_required"
+        else:
+            reason = "partial_verification" if eligible_evidence else "verification_required"
+        return CompletionDecision(False, reason, status, evidence, eligible_evidence)
 
 
 @dataclass
@@ -83,6 +111,9 @@ class AgentResult:
     verification_evidence: list[str]
     verification_records: list[dict[str, Any]]
     changed_files: list[str]
+    changed_file_roles: dict[str, str] = field(default_factory=dict)
+    test_provenance_policy: str = "warn"
+    eligible_verification_evidence: list[str] = field(default_factory=list)
     task_plan: list[dict[str, Any]] = field(default_factory=list)
     context_compactions: int = 0
     history: list[dict[str, Any]] = field(default_factory=list)
@@ -99,6 +130,7 @@ class Agent:
         max_repeated_tool_batches: int = 3,
         max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
         verification_policy: str = "test",
+        test_provenance_policy: str = "warn",
         approve_incomplete: Callable[[dict[str, Any]], bool] | None = None,
         on_event: Any = None,
     ) -> None:
@@ -114,7 +146,10 @@ class Agent:
         self.max_tool_result_chars = max_tool_result_chars
         self.max_repeated_tool_batches = max_repeated_tool_batches
         self.max_context_chars = max_context_chars
-        self.completion_policy = CompletionPolicy(verification_policy)
+        self.completion_policy = CompletionPolicy(
+            verification_policy,
+            test_provenance_policy,
+        )
         self.approve_incomplete = approve_incomplete or (lambda _review: False)
         self.on_event = on_event or (lambda _event: None)
 
@@ -130,7 +165,13 @@ class Agent:
             {"role": "system", "content": SYSTEM_PROMPT},
             {
                 "role": "user",
-                "content": f"Workspace: {self.executor.workspace}\nTask: {task}",
+                "content": (
+                    f"Workspace: {self.executor.workspace}\n"
+                    f"Controller verification policy: {self.completion_policy.minimum}\n"
+                    "Controller test provenance policy: "
+                    f"{self.completion_policy.test_provenance_policy}\n"
+                    f"Task: {task}"
+                ),
             },
         ]
         tool_call_count = 0
@@ -199,7 +240,10 @@ class Agent:
                     "verification_policy": self.completion_policy.minimum,
                     "verification_status": decision.verification_status,
                     "verification_evidence": decision.evidence,
+                    "eligible_verification_evidence": decision.eligible_evidence,
+                    "test_provenance_policy": self.completion_policy.test_provenance_policy,
                     "changed_files": sorted(self.executor.changed_files),
+                    "changed_file_roles": dict(self.executor.file_roles),
                     "task_plan": self.task_plan.snapshot(),
                 }
                 self._emit(
@@ -346,6 +390,11 @@ class Agent:
             verification_evidence=self.executor.verification_evidence,
             verification_records=[record.to_dict() for record in self.executor.verification_records],
             changed_files=sorted(self.executor.changed_files),
+            changed_file_roles=dict(self.executor.file_roles),
+            test_provenance_policy=self.completion_policy.test_provenance_policy,
+            eligible_verification_evidence=self.executor.verification_evidence_for_provenance(
+                self.completion_policy.test_provenance_policy
+            ),
             task_plan=self.task_plan.snapshot(),
             context_compactions=self.context_manager.compaction_count,
             history=history,
@@ -433,8 +482,13 @@ class Agent:
             "change_version": self.executor.change_version,
             "changed_files": sorted(self.executor.changed_files),
             "file_versions": dict(self.executor.file_versions),
+            "file_roles": dict(self.executor.file_roles),
             "verification_status": self.executor.verification_status,
             "verification_evidence": self.executor.verification_evidence,
+            "eligible_verification_evidence": self.executor.verification_evidence_for_provenance(
+                self.completion_policy.test_provenance_policy
+            ),
+            "test_provenance_policy": self.completion_policy.test_provenance_policy,
             "test_provenance_risks": sorted(
                 {
                     record.test_provenance_risk
@@ -463,6 +517,21 @@ class Agent:
                 f"is incomplete: {unfinished}. Continue the current item, perform real tool work, "
                 "then call update_plan with valid state transitions."
             )
+        if decision.reason == "independent_test_required":
+            modified_tests = sorted(
+                {
+                    path
+                    for record in self.executor.current_verification_records
+                    for path in record.agent_modified_test_files
+                }
+            )
+            return (
+                "Controller rejected the completion proposal because the test provenance policy "
+                "is 'independent'. Tests changed by this agent run cannot be the only completion "
+                "evidence. Run a relevant pre-existing or external test without changing it, or "
+                "hand the limitation to the user for final review. Agent-modified tests: "
+                + (", ".join(modified_tests) or "(unknown)")
+            )
         return (
             "Controller rejected the completion proposal because its deterministic "
             f"verification policy is '{self.completion_policy.minimum}'. "
@@ -485,8 +554,11 @@ def save_transcript(path: str, result: AgentResult) -> None:
             "verification_status": result.verification_status,
             "verification_policy": result.verification_policy,
             "verification_evidence": result.verification_evidence,
+            "eligible_verification_evidence": result.eligible_verification_evidence,
+            "test_provenance_policy": result.test_provenance_policy,
             "verification_records": result.verification_records,
             "changed_files": result.changed_files,
+            "changed_file_roles": result.changed_file_roles,
             "task_plan": result.task_plan,
             "context_compactions": result.context_compactions,
         }

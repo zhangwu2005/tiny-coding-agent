@@ -7,11 +7,13 @@ import json
 from pathlib import Path
 
 from .agent import Agent, save_transcript
+from .console import configure_utf8_stdio
 from .provider import OpenAICompatibleClient, ProviderError
 from .tools import ToolExecutor, assess_command_risk
 
 
 def main() -> int:
+    configure_utf8_stdio()
     parser = argparse.ArgumentParser(description="A small coding agent using an OpenAI-compatible model")
     parser.add_argument("task", nargs="?", help="the programming task")
     parser.add_argument("--workspace", default=".", help="workspace directory (default: current directory)")
@@ -34,6 +36,15 @@ def main() -> int:
         choices=("none", "syntax", "test", "full"),
         default="test",
         help="minimum evidence required by the controller (default: test)",
+    )
+    parser.add_argument(
+        "--test-provenance-policy",
+        choices=("allow", "warn", "independent"),
+        default="warn",
+        help=(
+            "how controller treats tests changed by this agent run: allow, warn, "
+            "or require independent evidence (default: warn)"
+        ),
     )
     parser.add_argument(
         "--accept-incomplete",
@@ -65,12 +76,17 @@ def main() -> int:
             print("[acceptance] incomplete result accepted by command-line user policy")
             return True
         evidence = ", ".join(str(item) for item in review["verification_evidence"]) or "none"
+        eligible_evidence = (
+            ", ".join(str(item) for item in review["eligible_verification_evidence"]) or "none"
+        )
         print(
             "\n[user acceptance] The controller cannot approve this completion proposal.\n"
             f"  reason: {review['reason']}\n"
             f"  required policy: {review['verification_policy']}\n"
             f"  current status: {review['verification_status']}\n"
-            f"  successful evidence: {evidence}"
+            f"  successful evidence: {evidence}\n"
+            f"  provenance policy: {review['test_provenance_policy']}\n"
+            f"  eligible evidence: {eligible_evidence}"
         )
         answer = input("Type 'accept' to accept it anyway; anything else rejects: ").strip().lower()
         return answer == "accept"
@@ -133,6 +149,7 @@ def main() -> int:
             max_repeated_tool_batches=args.repeat_limit,
             max_context_chars=args.context_limit,
             verification_policy=args.verification_policy,
+            test_provenance_policy=args.test_provenance_policy,
             approve_incomplete=approve_incomplete,
             on_event=event,
         ).run(task)
@@ -147,18 +164,35 @@ def main() -> int:
             if record.get("test_provenance_risk") not in {None, "not_applicable"}
         }
     )
+    role_counts: dict[str, int] = {}
+    for role in result.changed_file_roles.values():
+        role_counts[role] = role_counts.get(role, 0) + 1
+    rendered_roles = ",".join(
+        f"{role}:{count}" for role, count in sorted(role_counts.items())
+    ) or "none"
     print(
         f"\n[summary] stop_reason={result.stop_reason} "
         f"steps={result.steps} tool_calls={result.tool_calls} "
         f"verification={result.verification_status} "
         f"policy={result.verification_policy} "
         f"evidence={','.join(result.verification_evidence) or 'none'} "
+        f"eligible_evidence={','.join(result.eligible_verification_evidence) or 'none'} "
+        f"provenance_policy={result.test_provenance_policy} "
         f"records={len(result.verification_records)} "
         f"test_risk={','.join(test_risks) or 'none'} "
+        f"file_roles={rendered_roles} "
         f"plan_items={len(result.task_plan)} "
         f"context_compactions={result.context_compactions} "
         f"changed_files={len(result.changed_files)}"
     )
+    if (
+        result.test_provenance_policy == "warn"
+        and "elevated_agent_modified_tests" in test_risks
+    ):
+        print(
+            "[warning] passing evidence includes tests changed by this agent run; "
+            "review those tests or use --test-provenance-policy independent"
+        )
     if args.transcript:
         save_transcript(args.transcript, result)
         print(f"[transcript] {args.transcript}")

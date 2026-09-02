@@ -77,6 +77,8 @@ class ContextManager:
                 "changed_file_count": len(state.get("changed_files") or []),
                 "verification_status": state.get("verification_status"),
                 "verification_evidence": state.get("verification_evidence") or [],
+                "eligible_verification_evidence": state.get("eligible_verification_evidence") or [],
+                "test_provenance_policy": state.get("test_provenance_policy"),
                 "test_provenance_risks": state.get("test_provenance_risks") or [],
                 "last_failure": (
                     {
@@ -98,6 +100,7 @@ class ContextManager:
                 "change_version": state.get("change_version", 0),
                 "changed_file_count": len(state.get("changed_files") or []),
                 "verification_status": state.get("verification_status"),
+                "test_provenance_policy": state.get("test_provenance_policy"),
             }
             content = prefix + json.dumps(minimal, ensure_ascii=False, sort_keys=True)
         return {"role": "user", "content": content}
@@ -107,6 +110,7 @@ class ContextManager:
         plan = state.get("task_plan") or []
         changed_files = list(state.get("changed_files") or [])
         file_versions = state.get("file_versions") or {}
+        file_roles = state.get("file_roles") or {}
         failure = state.get("last_verification_failure") or {}
         bounded_plan = [
             {
@@ -125,8 +129,12 @@ class ContextManager:
             "changed_files_omitted": max(0, len(changed_files) - 10),
             "file_versions": dict(list(file_versions.items())[:10]),
             "file_versions_omitted": max(0, len(file_versions) - 10),
+            "file_roles": dict(list(file_roles.items())[:10]),
+            "file_roles_omitted": max(0, len(file_roles) - 10),
             "verification_status": state.get("verification_status"),
             "verification_evidence": state.get("verification_evidence") or [],
+            "eligible_verification_evidence": state.get("eligible_verification_evidence") or [],
+            "test_provenance_policy": state.get("test_provenance_policy"),
             "test_provenance_risks": state.get("test_provenance_risks") or [],
             "last_verification_failure": (
                 {
